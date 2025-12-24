@@ -2024,6 +2024,7 @@ with tab3:
                 f"Status: {evt_status}</div></div>",
                 unsafe_allow_html=True
             )
+            
                 with c6_:
             st.markdown(
                 f"""
@@ -2320,4 +2321,5 @@ with tab6:
 # =========================
 st.write("")
 st.caption("⚠️ Esto no es asesoramiento financiero. Es una app educativa/analítica: en cripto, el riesgo de pérdida es alto.")
+
 
