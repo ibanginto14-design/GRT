@@ -155,6 +155,47 @@ def explain_score(score: float) -> str:
         return "Confluencia baja: predominan señales débiles o de riesgo."
     return "Riesgo elevado: señales mayoritariamente en contra."
 
+def explain_auc(auc: float) -> str:
+    if auc is None or not np.isfinite(auc):
+        return "AUC no disponible (test con una sola clase o modelo sin entrenar)."
+    if auc >= 0.65:
+        return "Buena señal: el modelo discrimina mejor que azar con margen."
+    if auc >= 0.55:
+        return "Señal débil: algo mejor que azar, pero con poca ventaja."
+    if auc >= 0.50:
+        return "Cerca de azar: el modelo apenas separa subidas vs bajadas."
+    return "Peor que azar: probable sobreajuste o señal invertida."
+
+def explain_sample_quality(n_train: int, n_test: int, rows_clean: int) -> str:
+    n = (n_train or 0) + (n_test or 0)
+    if n == 0 or rows_clean == 0:
+        return "Sin datos útiles tras limpiar (NaNs/alineación)."
+    if n < 250:
+        return "Pocos datos: fiabilidad baja, úsalo solo como referencia."
+    if n < 500:
+        return "Datos moderados: fiabilidad media, mejor con confirmaciones."
+    return "Buen tamaño de muestra: fiabilidad mejor (aun con incertidumbre)."
+
+def model_summary_text(p: float, auc: float, n_train: int, n_test: int, rows_clean: int, h: int) -> str:
+    p_txt = explain_prob(p, h)
+    auc_txt = explain_auc(auc)
+    samp_txt = explain_sample_quality(n_train, n_test, rows_clean)
+
+    # Mensaje final “de una línea”
+    if (p is not None and np.isfinite(p)) and (auc is not None and np.isfinite(auc)):
+        if auc >= 0.60 and p >= 0.60:
+            headline = "✅ Señal coherente (prob + calidad aceptable)."
+        elif auc < 0.55 and p >= 0.60:
+            headline = "⚠️ Probabilidad alta, pero calidad débil (ojo)."
+        elif auc >= 0.60 and p < 0.50:
+            headline = "⚠️ Calidad ok, pero sesgo bajista/lateral."
+        else:
+            headline = "🟡 Señal mixta (no concluyente)."
+    else:
+        headline = "—"
+
+    return f"{headline} {p_txt} {auc_txt} {samp_txt}"
+
 def explain_prob(p: float, horizon_days: int) -> str:
     if p is None or not np.isfinite(p):
         return f"Sin probabilidad calculada para {horizon_days}d (faltan datos o el modelo no entrenó)."
@@ -886,6 +927,29 @@ with tab2:
                 "Rows clean": diag.get(h, {}).get("rows_after_clean", 0),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
+st.write("")
+st.markdown("### Interpretación rápida por horizonte")
+
+for h in [7, 30, 90]:
+    rep = report.get(h, {})
+    p = probs.get(h, np.nan)
+    auc = rep.get("auc", np.nan)
+    n_train = rep.get("n_train", 0)
+    n_test = rep.get("n_test", 0)
+    rows_clean = diag.get(h, {}).get("rows_after_clean", 0)
+
+    text = model_summary_text(p, auc, n_train, n_test, rows_clean, h)
+
+    st.markdown(
+        f"""
+        <div class='kpi'>
+          <div class='label'>Horizonte {h} días</div>
+          <div class='value'>P(↑) {_fmt_pct(p)} · AUC {(auc if np.isfinite(auc) else np.nan):.3f}</div>
+          <div class='hint'>{text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
         h_sel = st.selectbox("Ver factores top para horizonte", [7,30,90], index=1)
         top_feats = report.get(h_sel, {}).get("top_features", [])
@@ -919,5 +983,6 @@ with tab4:
             st.download_button("⬇️ Descargar daily_results.csv", f, file_name="daily_results.csv", mime="text/csv")
 
 st.caption("⚠️ Esto no garantiza subidas. Reduce incertidumbre con confluencia + gestión de riesgo.")
+
 
 
