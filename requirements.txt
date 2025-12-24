@@ -2,6 +2,10 @@ streamlit
 pandas
 numpy
 ccxt
+requests
 statsmodels
 arch
 ruptures
+scikit-learn
+plotly
+hmmlearn
