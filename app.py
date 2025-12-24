@@ -1,7 +1,7 @@
 import os
 import json
 from datetime import datetime, timezone
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -9,6 +9,7 @@ import streamlit as st
 
 import requests
 import ccxt
+import xml.etree.ElementTree as ET
 
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller, kpss
@@ -44,8 +45,6 @@ RESULTS_PATH = os.path.join(DATA_DIR, "daily_results.csv")
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
 
 FALLBACK_EXCHANGES = ["kraken", "coinbase", "bitstamp"]
-
-# (Si algún día usas Gateway) - mantenemos por compatibilidad
 GRAPH_NETWORK_SUBGRAPH_ID = "GgwLf9BTFBJi6Z5iYHssMAGEE4w5dR3Jox2dMLrBxnCT"
 
 DEFAULT_SETTINGS = {
@@ -56,12 +55,17 @@ DEFAULT_SETTINGS = {
     "timeframe": "1d",
     "api_keys": {
         "thegraph_gateway": ""   # opcional
+    },
+    "news": {
+        "enable": True,
+        "lookback_days": 14,
+        "rss_timeout": 15
     }
 }
 
 
 # =========================
-# UI THEME (épico)
+# UI THEME (épico + micro-animaciones)
 # =========================
 EPIC_CSS = """
 <style>
@@ -78,17 +82,21 @@ EPIC_CSS = """
   --bad:#EF4444;
   --line:#1E2A55;
 }
+
 html, body, [class*="css"]  {
   background: radial-gradient(1200px 600px at 20% -10%, rgba(168,85,247,0.35), transparent 60%),
               radial-gradient(900px 500px at 110% 10%, rgba(34,197,94,0.20), transparent 55%),
               linear-gradient(180deg, var(--bg0), var(--bg1));
   color: var(--text) !important;
 }
+
 section[data-testid="stSidebar"]{
   background: linear-gradient(180deg, rgba(15,23,48,0.95), rgba(11,16,32,0.95)) !important;
   border-right: 1px solid rgba(30,42,85,0.7);
 }
+
 .block-container{ padding-top: 1.1rem; }
+
 .epic-hero{
   padding: 18px 18px;
   border-radius: 18px;
@@ -96,39 +104,65 @@ section[data-testid="stSidebar"]{
   border: 1px solid rgba(30,42,85,0.7);
   box-shadow: 0 18px 60px rgba(0,0,0,0.35);
 }
-.epic-title{ font-size: 26px; font-weight: 800; letter-spacing: -0.3px; }
-.epic-sub{ color: var(--muted); font-size: 14px; }
+
+.epic-title{ font-size: 26px; font-weight: 900; letter-spacing: -0.4px; }
+.epic-sub{ color: var(--muted); font-size: 14px; margin-top: 6px; }
+
+.badge{
+  display:inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  margin-left: 10px;
+  font-size: 12px;
+  color: var(--text);
+  border: 1px solid rgba(168,85,247,0.35);
+  background: rgba(168,85,247,0.12);
+}
+
 .kpi{
   border-radius: 16px;
   padding: 14px 14px;
   background: linear-gradient(180deg, rgba(15,23,48,0.95), rgba(16,27,59,0.85));
   border: 1px solid rgba(30,42,85,0.7);
+  box-shadow: 0 14px 40px rgba(0,0,0,0.25);
+  transition: transform .12s ease, border-color .12s ease;
+  color: var(--text) !important;
 }
-.kpi{
-  border-radius: 16px;
-  padding: 14px 14px;
-  background: linear-gradient(180deg, rgba(15,23,48,0.95), rgba(16,27,59,0.85));
-  border: 1px solid rgba(30,42,85,0.7);
-  color: var(--text) !important;                 /* <- FIX */
+
+.kpi:hover{
+  transform: translateY(-2px);
+  border-color: rgba(168,85,247,0.55);
 }
-.kpi *{
-  color: var(--text) !important;                 /* <- FIX: fuerza todo dentro */
-}
+
+.kpi *{ color: var(--text) !important; }
+
 .kpi .label{
-  color: var(--muted) !important;                /* <- FIX */
+  color: var(--muted) !important;
   font-size: 12px;
   margin-bottom: 6px;
 }
+
 .kpi .value{
-  color: var(--text) !important;                 /* <- FIX */
+  color: var(--text) !important;
   font-size: 20px;
-  font-weight: 800;
+  font-weight: 900;
+  letter-spacing: -0.2px;
 }
+
 .kpi .hint{
-  color: var(--muted) !important;                /* <- FIX */
+  color: var(--muted) !important;
   font-size: 11px;
   margin-top: 6px;
+  line-height: 1.25rem;
 }
+
+hr { border-color: rgba(30,42,85,0.55) !important; }
+
+.small-muted{
+  color: var(--muted);
+  font-size: 12px;
+}
+
 </style>
 """
 st.markdown(EPIC_CSS, unsafe_allow_html=True)
@@ -142,86 +176,19 @@ def _fmt_pct(p: float) -> str:
         return "—"
     return f"{p*100:.1f}%"
 
-def explain_score(score: float) -> str:
-    if score is None or not np.isfinite(score):
-        return "Sin cálculo aún. Pulsa “Actualizar”."
-    if score >= 75:
-        return "Confluencia alta: señales alineadas (tendencia + momentum + riesgo)."
-    if score >= 60:
-        return "Confluencia moderada: hay señales a favor, pero con dudas."
-    if score >= 45:
-        return "Zona neutra: señales mezcladas, mejor esperar confirmación."
-    if score >= 30:
-        return "Confluencia baja: predominan señales débiles o de riesgo."
-    return "Riesgo elevado: señales mayoritariamente en contra."
+def _fmt_num(x: float, digits=3) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    return f"{x:.{digits}f}"
 
-def explain_auc(auc: float) -> str:
-    if auc is None or not np.isfinite(auc):
-        return "AUC no disponible (test con una sola clase o modelo sin entrenar)."
-    if auc >= 0.65:
-        return "Buena señal: el modelo discrimina mejor que azar con margen."
-    if auc >= 0.55:
-        return "Señal débil: algo mejor que azar, pero con poca ventaja."
-    if auc >= 0.50:
-        return "Cerca de azar: el modelo apenas separa subidas vs bajadas."
-    return "Peor que azar: probable sobreajuste o señal invertida."
-
-def explain_sample_quality(n_train: int, n_test: int, rows_clean: int) -> str:
-    n = (n_train or 0) + (n_test or 0)
-    if n == 0 or rows_clean == 0:
-        return "Sin datos útiles tras limpiar (NaNs/alineación)."
-    if n < 250:
-        return "Pocos datos: fiabilidad baja, úsalo solo como referencia."
-    if n < 500:
-        return "Datos moderados: fiabilidad media, mejor con confirmaciones."
-    return "Buen tamaño de muestra: fiabilidad mejor (aun con incertidumbre)."
-
-def model_summary_text(p: float, auc: float, n_train: int, n_test: int, rows_clean: int, h: int) -> str:
-    p_txt = explain_prob(p, h)
-    auc_txt = explain_auc(auc)
-    samp_txt = explain_sample_quality(n_train, n_test, rows_clean)
-
-    # Mensaje final “de una línea”
-    if (p is not None and np.isfinite(p)) and (auc is not None and np.isfinite(auc)):
-        if auc >= 0.60 and p >= 0.60:
-            headline = "✅ Señal coherente (prob + calidad aceptable)."
-        elif auc < 0.55 and p >= 0.60:
-            headline = "⚠️ Probabilidad alta, pero calidad débil (ojo)."
-        elif auc >= 0.60 and p < 0.50:
-            headline = "⚠️ Calidad ok, pero sesgo bajista/lateral."
-        else:
-            headline = "🟡 Señal mixta (no concluyente)."
-    else:
-        headline = "—"
-
-    return f"{headline} {p_txt} {auc_txt} {samp_txt}"
-
-def explain_prob(p: float, horizon_days: int) -> str:
-    if p is None or not np.isfinite(p):
-        return f"Sin probabilidad calculada para {horizon_days}d (faltan datos o el modelo no entrenó)."
-    if p >= 0.70:
-        return f"Alta probabilidad según el modelo para {horizon_days} días. Aun así, no es garantía."
-    if p >= 0.60:
-        return f"Ventaja ligera a favor de subida a {horizon_days} días."
-    if p >= 0.50:
-        return f"Escenario muy equilibrado a {horizon_days} días (casi 50/50)."
-    if p >= 0.40:
-        return f"Ventaja ligera a favor de bajada o lateralidad a {horizon_days} días."
-    return f"Probabilidad baja de subida a {horizon_days} días (modelo ve más riesgo)."
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def load_settings() -> dict:
-    if not os.path.exists(SETTINGS_PATH):
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_SETTINGS, f, indent=2, ensure_ascii=False)
-        return DEFAULT_SETTINGS
-    with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_settings(s: dict) -> None:
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(s, f, indent=2, ensure_ascii=False)
+def _fmt_money(x: float) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    if abs(x) >= 1e9:
+        return f"${x/1e9:.2f}B"
+    if abs(x) >= 1e6:
+        return f"${x/1e6:.2f}M"
+    return f"${x:,.0f}"
 
 def safe_float(x):
     try:
@@ -234,14 +201,107 @@ def safe_float(x):
     except Exception:
         return np.nan
 
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def load_settings() -> dict:
+    if not os.path.exists(SETTINGS_PATH):
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_SETTINGS, f, indent=2, ensure_ascii=False)
+        return DEFAULT_SETTINGS
+    with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+        s = json.load(f)
+    # backfill keys
+    for k, v in DEFAULT_SETTINGS.items():
+        if k not in s:
+            s[k] = v
+    if "news" not in s:
+        s["news"] = DEFAULT_SETTINGS["news"]
+    return s
+
+def save_settings(s: dict) -> None:
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(s, f, indent=2, ensure_ascii=False)
+
 def _symbol_variants(symbol: str):
     base, quote = symbol.split("/")
     variants = [symbol]
-    # fallback si USDT no existe
     if quote.upper() == "USDT":
         variants += [f"{base}/USD", f"{base}/USDC"]
     return variants
 
+def explain_score(score: float) -> str:
+    if score is None or not np.isfinite(score):
+        return "Sin cálculo aún. Pulsa “Actualizar”."
+    if score >= 75:
+        return "Confluencia alta: varias señales alineadas (tendencia + momentum + riesgo + news)."
+    if score >= 60:
+        return "Confluencia moderada: señales a favor, pero con dudas."
+    if score >= 45:
+        return "Zona neutra: señales mezcladas, mejor esperar confirmación."
+    if score >= 30:
+        return "Confluencia baja: predominan señales débiles o de riesgo."
+    return "Riesgo elevado: el conjunto apunta más a cautela."
+
+def explain_auc(auc: float) -> str:
+    if auc is None or not np.isfinite(auc):
+        return "AUC no disponible (pocos datos o test con una sola clase)."
+    if auc >= 0.70:
+        return "Muy buena: el modelo separa subidas/bajadas bastante bien."
+    if auc >= 0.60:
+        return "Aceptable: algo de ventaja real frente al azar."
+    if auc >= 0.55:
+        return "Débil: pequeña ventaja, úsalo con prudencia."
+    if auc >= 0.50:
+        return "Casi azar: apenas discrimina."
+    return "Peor que azar: señal invertida o sobreajuste."
+
+def explain_prob(p: float, horizon_days: int) -> str:
+    if p is None or not np.isfinite(p):
+        return f"Sin probabilidad calculada para {horizon_days}d (faltan datos o el modelo no entrenó)."
+    if p >= 0.75:
+        return f"Alta probabilidad de subida a {horizon_days} días según el modelo (no es garantía)."
+    if p >= 0.60:
+        return f"Ventaja ligera a favor de subida a {horizon_days} días."
+    if p >= 0.50:
+        return f"Escenario equilibrado a {horizon_days} días (casi 50/50)."
+    if p >= 0.40:
+        return f"Ventaja ligera a favor de bajada o lateralidad a {horizon_days} días."
+    return f"Probabilidad baja de subida a {horizon_days} días (más riesgo)."
+
+def explain_sample_quality(n_train: int, n_test: int, rows_clean: int) -> str:
+    n = (n_train or 0) + (n_test or 0)
+    if n == 0 or rows_clean == 0:
+        return "Sin datos útiles tras limpiar (NaNs/alineación)."
+    if n < 250:
+        return "Pocos datos: fiabilidad baja, úsalo como referencia."
+    if n < 500:
+        return "Datos moderados: fiabilidad media; confirma con otras señales."
+    return "Buen tamaño de muestra: fiabilidad mejor (aun con incertidumbre)."
+
+def model_summary_text(p: float, auc: float, n_train: int, n_test: int, rows_clean: int, h: int) -> str:
+    p_txt = explain_prob(p, h)
+    auc_txt = explain_auc(auc)
+    samp_txt = explain_sample_quality(n_train, n_test, rows_clean)
+
+    if (p is not None and np.isfinite(p)) and (auc is not None and np.isfinite(auc)):
+        if auc >= 0.62 and p >= 0.62:
+            headline = "✅ Señal coherente (prob + calidad aceptable)."
+        elif auc < 0.55 and p >= 0.62:
+            headline = "⚠️ Probabilidad alta, pero calidad débil (ojo)."
+        elif auc >= 0.62 and p < 0.50:
+            headline = "⚠️ Calidad ok, pero sesgo bajista/lateral."
+        else:
+            headline = "🟡 Señal mixta (no concluyente)."
+    else:
+        headline = "—"
+
+    return f"{headline} {p_txt} {auc_txt} {samp_txt}"
+
+
+# =========================
+# DATA FETCH
+# =========================
 @st.cache_data(ttl=60*60)
 def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     exchanges_to_try = [exchange_id] + [ex for ex in FALLBACK_EXCHANGES if ex != exchange_id]
@@ -269,7 +329,6 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, limit: int) -> pd
         except Exception as e:
             last_err = e
             msg = str(e).lower()
-            # errores típicos por región/restricción
             if ("451" in msg) or ("restricted location" in msg) or ("eligibility" in msg):
                 continue
             continue
@@ -287,7 +346,7 @@ def compute_returns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# FUNDAMENTALS (SIN WALLET) - CoinGecko fallback
+# FUNDAMENTALS (CoinGecko)
 # =========================
 @st.cache_data(ttl=6*60*60)
 def fetch_grt_fundamentals_coingecko() -> pd.DataFrame:
@@ -311,8 +370,6 @@ def fetch_grt_fundamentals_coingecko() -> pd.DataFrame:
     }
     return pd.DataFrame([row]).set_index("as_of")
 
-
-# (Opcional) Gateway – si lo usas algún día
 def _graphql_post(url: str, query: str, variables=None, timeout=25) -> dict:
     payload = {"query": query, "variables": variables or {}}
     r = requests.post(url, json=payload, timeout=timeout)
@@ -355,7 +412,229 @@ def fetch_grt_network_fundamentals_gateway(thegraph_api_key: str) -> pd.DataFram
 
 
 # =========================
-# METRICS
+# NEWS (RSS) -> Sentiment 0..100
+# =========================
+POS_WORDS = {
+    "upgrade","partnership","launch","released","adoption","growth","record","surge","bull",
+    "win","success","breakthrough","milestone","approval","support","integrates","expands",
+    "strong","beats","positive","accumulate","accumulation","listing","listed"
+}
+NEG_WORDS = {
+    "hack","exploit","lawsuit","ban","down","dump","bear","crash","collapse","fraud","scam",
+    "risk","warning","investigation","liquidation","delay","weak","negative","sec","rejected",
+    "outage","attack","security","breach","concern"
+}
+
+def _clean_text(s: str) -> str:
+    if not s:
+        return ""
+    return "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in s)
+
+def score_sentiment(text: str) -> float:
+    t = _clean_text(text)
+    if not t.strip():
+        return 0.0
+    words = [w for w in t.split() if len(w) > 2]
+    if not words:
+        return 0.0
+    pos = sum(1 for w in words if w in POS_WORDS)
+    neg = sum(1 for w in words if w in NEG_WORDS)
+    raw = (pos - neg) / max(1, (pos + neg))
+    return float(raw)
+
+@st.cache_data(ttl=60*30)
+def fetch_rss_items(url: str, timeout: int = 15, max_items: int = 25) -> List[dict]:
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+
+    items = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        items.append({"title": title, "link": link, "pubDate": pub, "desc": desc})
+        if len(items) >= max_items:
+            break
+    return items
+
+def build_news_panel(enable: bool, lookback_days: int, timeout: int) -> Tuple[float, pd.DataFrame]:
+    if not enable:
+        return np.nan, pd.DataFrame()
+
+    # Google News RSS (sin key)
+    queries = [
+        "The+Graph+GRT",
+        "The+Graph+protocol",
+        "GRT+token",
+    ]
+    rss_urls = [f"https://news.google.com/rss/search?q={q}&hl=en&gl=US&ceid=US:en" for q in queries]
+
+    all_items = []
+    for u in rss_urls:
+        try:
+            all_items.extend(fetch_rss_items(u, timeout=timeout, max_items=25))
+        except Exception:
+            continue
+
+    if not all_items:
+        return np.nan, pd.DataFrame()
+
+    # Score each headline
+    rows = []
+    for it in all_items:
+        txt = f"{it.get('title','')} {it.get('desc','')}"
+        s = score_sentiment(txt)
+        rows.append({
+            "title": it.get("title",""),
+            "pubDate": it.get("pubDate",""),
+            "link": it.get("link",""),
+            "sent": s
+        })
+
+    df_news = pd.DataFrame(rows).drop_duplicates(subset=["title"]).head(50)
+
+    # Convert to 0..100 score (centered at 50)
+    # We keep it simple and robust.
+    if df_news.empty:
+        return np.nan, df_news
+
+    # Use trimmed mean to reduce outliers
+    svals = df_news["sent"].astype(float).values
+    svals = svals[np.isfinite(svals)]
+    if len(svals) == 0:
+        return np.nan, df_news
+
+    svals_sorted = np.sort(svals)
+    k = max(0, int(0.1 * len(svals_sorted)))
+    core = svals_sorted[k:len(svals_sorted)-k] if len(svals_sorted) > 10 else svals_sorted
+    m = float(np.mean(core)) if len(core) else float(np.mean(svals_sorted))
+
+    score_0_100 = float(np.clip(50 + 50*m, 0, 100))
+    df_news["sent_0_100"] = (50 + 50*df_news["sent"]).clip(0, 100)
+
+    return score_0_100, df_news
+
+def explain_news_score(x: float) -> str:
+    if x is None or not np.isfinite(x):
+        return "No disponible (RSS falló o está desactivado)."
+    if x >= 65:
+        return "Titulares claramente positivos: suele acompañar a fases de impulso, pero ojo con el hype."
+    if x >= 55:
+        return "Ligero sesgo positivo: apoyo contextual, no suficiente por sí solo."
+    if x >= 45:
+        return "Neutral: noticias mezcladas o irrelevantes."
+    if x >= 35:
+        return "Sesgo negativo: aumenta la probabilidad de volatilidad/venta defensiva."
+    return "Muy negativo: cuidado con shocks (pero puede haber rebotes técnicos)."
+
+
+# =========================
+# TECHNICAL INDICATORS
+# =========================
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = (-delta).clip(lower=0)
+    roll_up = up.rolling(period).mean()
+    roll_down = down.rolling(period).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def macd(series: pd.Series, fast=12, slow=26, signal=9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    m_fast = ema(series, fast)
+    m_slow = ema(series, slow)
+    line = m_fast - m_slow
+    sig = ema(line, signal)
+    hist = line - sig
+    return line, sig, hist
+
+def bollinger_pctb(series: pd.Series, window=20, nstd=2.0) -> pd.Series:
+    ma = series.rolling(window).mean()
+    sd = series.rolling(window).std()
+    upper = ma + nstd * sd
+    lower = ma - nstd * sd
+    return (series - lower) / (upper - lower + 1e-12)
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = pd.concat([
+        (high - low),
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
+
+    atr_ = tr.rolling(period).mean()
+    plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(period).mean() / (atr_ + 1e-12))
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(period).mean() / (atr_ + 1e-12))
+    dx = (100 * (plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-12))
+    return dx.rolling(period).mean()
+
+def max_drawdown(close: pd.Series) -> float:
+    c = close.astype(float)
+    roll_max = c.cummax()
+    dd = (c / roll_max) - 1.0
+    return float(dd.min()) if len(dd.dropna()) else np.nan
+
+def var_cvar(r: pd.Series, alpha=0.05) -> Tuple[float, float]:
+    x = r.dropna().astype(float)
+    if len(x) < 250:
+        return np.nan, np.nan
+    q = np.quantile(x, alpha)
+    cvar = float(x[x <= q].mean()) if np.any(x <= q) else np.nan
+    return float(q), float(cvar)
+
+def sharpe_simple(r: pd.Series, periods_per_year=365) -> float:
+    x = r.dropna().astype(float)
+    if len(x) < 180:
+        return np.nan
+    mu = x.mean() * periods_per_year
+    sd = x.std() * np.sqrt(periods_per_year)
+    return float(mu / (sd + 1e-12))
+
+def beta_vs_bench(asset_r: pd.Series, bench_r: pd.Series, window=180) -> float:
+    tmp = pd.concat([asset_r.rename("a"), bench_r.rename("b")], axis=1).dropna()
+    tmp = tmp.tail(window)
+    if len(tmp) < 60:
+        return np.nan
+    cov = np.cov(tmp["a"], tmp["b"])[0, 1]
+    varb = np.var(tmp["b"])
+    return float(cov / (varb + 1e-12))
+
+def realized_vol(r: pd.Series, window=30) -> float:
+    x = r.dropna().tail(window)
+    if len(x) < 20:
+        return np.nan
+    return float(x.std() * np.sqrt(365))
+
+
+# =========================
+# METRICS (base + añadidas)
 # =========================
 def trend_regression(df: pd.DataFrame, window: int = 90) -> dict:
     d = df.dropna().tail(window).copy()
@@ -377,9 +656,10 @@ def stationarity_tests(df: pd.DataFrame) -> dict:
 
 def momentum_metrics(df: pd.DataFrame) -> dict:
     r = df["ret"].dropna()
+    r7 = float((1 + r.tail(7)).prod() - 1) if len(r) >= 7 else np.nan
     r30 = float((1 + r.tail(30)).prod() - 1) if len(r) >= 30 else np.nan
     r90 = float((1 + r.tail(90)).prod() - 1) if len(r) >= 90 else np.nan
-    return {"mom_ret_30d": r30, "mom_ret_90d": r90}
+    return {"mom_ret_7d": r7, "mom_ret_30d": r30, "mom_ret_90d": r90}
 
 def volume_signal(df: pd.DataFrame) -> dict:
     v = df["volume"]
@@ -420,19 +700,51 @@ def structural_breaks(df: pd.DataFrame) -> dict:
     recent = any((len(y) - bp) <= 30 for bp in b) if len(b) else False
     return {"breakpoints_n": float(len(b)), "break_recent": float(1.0 if recent else 0.0)}
 
+def extra_market_stats(df: pd.DataFrame, dfb: pd.DataFrame) -> dict:
+    close = df["close"].astype(float)
+    r = df["ret"].dropna().astype(float)
+    rb = dfb["ret"].dropna().astype(float) if dfb is not None and not dfb.empty else pd.Series(dtype=float)
+
+    dd = max_drawdown(close)
+    v, c = var_cvar(r, alpha=0.05)
+    sh = sharpe_simple(r)
+    b = beta_vs_bench(df["ret"], dfb["ret"], window=180) if (dfb is not None and not dfb.empty) else np.nan
+    rv = realized_vol(r, window=30)
+
+    # Indicators
+    rsi14 = float(rsi(close, 14).iloc[-1]) if len(close) > 40 else np.nan
+    m_line, m_sig, m_hist = macd(close)
+    macd_line = float(m_line.iloc[-1]) if len(close) > 40 else np.nan
+    macd_hist = float(m_hist.iloc[-1]) if len(close) > 40 else np.nan
+    bb = float(bollinger_pctb(close).iloc[-1]) if len(close) > 40 else np.nan
+    atr14 = float(atr(df, 14).iloc[-1]) if len(df) > 40 else np.nan
+    adx14 = float(adx(df, 14).iloc[-1]) if len(df) > 60 else np.nan
+
+    ann_ret = float((1 + r.tail(365)).prod() - 1) if len(r) >= 365 else np.nan
+    ann_vol = float(r.tail(365).std() * np.sqrt(365)) if len(r) >= 180 else np.nan
+
+    return {
+        "max_drawdown": dd,
+        "var_95": v,
+        "cvar_95": c,
+        "sharpe_simple": sh,
+        "beta_180": b,
+        "realized_vol_30": rv,
+        "rsi_14": rsi14,
+        "macd_line": macd_line,
+        "macd_hist": macd_hist,
+        "bb_pctb": bb,
+        "atr_14": atr14,
+        "adx_14": adx14,
+        "ann_return_est": ann_ret,
+        "ann_vol_est": ann_vol,
+    }
+
 
 # =========================
-# HMM (ROBUSTO) - FIX del error covars
+# HMM (ROBUSTO)
 # =========================
 def hmm_regimes_robust(df: pd.DataFrame) -> dict:
-    """
-    Evita el error: 'covars' must be symmetric, positive-definite
-    usando:
-      - limpieza NaN/inf
-      - estandarización
-      - covariance_type='diag' (más estable)
-      - try/except (no rompe la app)
-    """
     if not HMM_AVAILABLE:
         return {"hmm_regime": None, "hmm_p_regime": np.nan, "hmm_status": "HMM not installed"}
 
@@ -447,17 +759,14 @@ def hmm_regimes_robust(df: pd.DataFrame) -> dict:
     if len(X) < 200:
         return {"hmm_regime": None, "hmm_p_regime": np.nan, "hmm_status": "Not enough clean rows"}
 
-    # Estandarizar
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X.values)
-
-    # Jitter mínimo por estabilidad numérica (si hay var ~0)
     Xs = Xs + np.random.normal(0, 1e-8, size=Xs.shape)
 
     try:
         model = GaussianHMM(
             n_components=3,
-            covariance_type="diag",   # <- MUCHO más estable que 'full'
+            covariance_type="diag",
             n_iter=300,
             random_state=7
         )
@@ -467,7 +776,6 @@ def hmm_regimes_robust(df: pd.DataFrame) -> dict:
         current_state = int(np.argmax(post[-1]))
         p_state = float(np.max(post[-1]))
 
-        # Etiquetado por retorno medio de cada estado (en escala original)
         states = model.predict(Xs)
         means = []
         r_aligned = X["ret"].values
@@ -481,16 +789,21 @@ def hmm_regimes_robust(df: pd.DataFrame) -> dict:
         return {"hmm_regime": label, "hmm_p_regime": p_state, "hmm_status": "OK"}
 
     except Exception as e:
-        # No rompemos la app
         return {"hmm_regime": None, "hmm_p_regime": np.nan, "hmm_status": f"HMM failed: {e}"}
 
 
 # =========================
-# FEATURES + MODELOS (para que P↑ no se quede vacío)
+# FEATURES + MODELOS (incluye NEWS)
 # =========================
-def build_feature_frame(df: pd.DataFrame, bench: pd.DataFrame, fund_last: Optional[pd.Series]) -> pd.DataFrame:
+def build_feature_frame(
+    df: pd.DataFrame,
+    bench: pd.DataFrame,
+    fund_last: Optional[pd.Series],
+    news_score_0_100: Optional[float]
+) -> pd.DataFrame:
     d = df.copy()
 
+    # core
     d["ret_1"] = d["ret"]
     d["ret_7"] = d["close"].pct_change(7)
     d["ret_30"] = d["close"].pct_change(30)
@@ -499,19 +812,34 @@ def build_feature_frame(df: pd.DataFrame, bench: pd.DataFrame, fund_last: Option
     d["mom_30"] = (1 + d["ret"]).rolling(30).apply(lambda x: np.prod(1 + x) - 1, raw=False)
     d["vol_z_14"] = (d["volume"].rolling(14).mean() - d["volume"].rolling(180).mean()) / (d["volume"].rolling(180).std() + 1e-12)
 
-    # correlación robusta por índice (si el benchmark tiene fechas diferentes, saldrán NaN al principio, pero no destruye todo)
+    # correlations / beta-ish
     tmp = pd.concat([d["ret"].rename("asset"), bench["ret"].rename("bench")], axis=1)
     d["corr_60"] = tmp["asset"].rolling(60).corr(tmp["bench"])
 
+    # tails
     d["skew_90"] = d["ret"].rolling(90).skew()
     d["kurt_90"] = d["ret"].rolling(90).kurt()
 
-    # fundamentals (as-of) -> lo “broadcast”
+    # indicators
+    d["rsi_14"] = rsi(d["close"].astype(float), 14)
+    macd_line, macd_sig, macd_hist = macd(d["close"].astype(float))
+    d["macd_line"] = macd_line
+    d["macd_hist"] = macd_hist
+    d["bb_pctb"] = bollinger_pctb(d["close"].astype(float))
+    d["atr_14"] = atr(d, 14)
+    d["adx_14"] = adx(d, 14)
+
+    # news as feature (constant today, broadcast to all rows)
+    if news_score_0_100 is not None and np.isfinite(news_score_0_100):
+        d["news_score_0_100"] = float(news_score_0_100)
+    else:
+        d["news_score_0_100"] = np.nan
+
+    # fundamentals (broadcast)
     if fund_last is not None and not fund_last.empty:
         for k, v in fund_last.to_dict().items():
             d[f"fund_{k}"] = safe_float(v)
 
-        # si tenemos supply/marketcap/circulating, creamos ratios útiles
         if "fund_cg_marketcap_usd" in d.columns and "fund_cg_volume_24h_usd" in d.columns:
             d["fund_mcap_to_vol"] = d["fund_cg_marketcap_usd"] / (d["fund_cg_volume_24h_usd"] + 1e-12)
 
@@ -532,7 +860,6 @@ def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_row
 
     X_all = feat[candidates].apply(pd.to_numeric, errors="coerce")
     X_all = X_all.replace([np.inf, -np.inf], np.nan)
-    # clave: no reventar el dataset
     X_all = X_all.ffill().bfill()
 
     probs = {}
@@ -563,7 +890,7 @@ def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_row
 
         logit = Pipeline([
             ("scaler", StandardScaler(with_mean=False)),
-            ("clf", LogisticRegression(max_iter=600, n_jobs=1))
+            ("clf", LogisticRegression(max_iter=700, n_jobs=1))
         ])
         gbt = GradientBoostingClassifier(random_state=7)
 
@@ -580,7 +907,6 @@ def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_row
         p_today = 0.5 * logit.predict_proba(last_row)[:, 1][0] + 0.5 * gbt.predict_proba(last_row)[:, 1][0]
         probs[h] = float(p_today)
 
-        # explainability
         try:
             imp = permutation_importance(gbt, X_test, y_test, n_repeats=7, random_state=7, scoring="roc_auc")
             imp_df = pd.DataFrame({"feature": X_test.columns, "importance": imp.importances_mean})
@@ -589,13 +915,18 @@ def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_row
         except Exception:
             top_feats = []
 
-        report[h] = {"auc": float(auc) if auc == auc else np.nan, "n_train": int(len(train)), "n_test": int(len(test)), "top_features": top_feats}
+        report[h] = {
+            "auc": float(auc) if auc == auc else np.nan,
+            "n_train": int(len(train)),
+            "n_test": int(len(test)),
+            "top_features": top_feats
+        }
 
     return probs, report, diag
 
 
 # =========================
-# SCORE
+# SCORE (añade NEWS y métricas extra)
 # =========================
 def grt_score(metrics: dict, probs: dict) -> float:
     s = 50.0
@@ -628,7 +959,31 @@ def grt_score(metrics: dict, probs: dict) -> float:
     if skew == skew:
         s += 4 if skew > 0.2 else (-4 if skew < -0.2 else 0)
 
-    # HMM (si está)
+    # extra: RSI/ADX
+    rsi14 = metrics.get("rsi_14", np.nan)
+    if rsi14 == rsi14:
+        if rsi14 < 30:
+            s += 4  # oversold -> rebote posible
+        elif rsi14 > 70:
+            s -= 4  # overbought -> riesgo de corrección
+
+    adx14 = metrics.get("adx_14", np.nan)
+    if adx14 == adx14:
+        s += 3 if adx14 > 25 else 0  # fuerza de tendencia
+
+    # NEWS
+    news = metrics.get("news_score_0_100", np.nan)
+    if news == news:
+        if news >= 65:
+            s += 6
+        elif news >= 55:
+            s += 3
+        elif news <= 35:
+            s -= 6
+        elif news <= 45:
+            s -= 3
+
+    # HMM
     reg = metrics.get("hmm_regime", None)
     pr = metrics.get("hmm_p_regime", np.nan)
     if isinstance(reg, str):
@@ -648,6 +1003,9 @@ def grt_score(metrics: dict, probs: dict) -> float:
     return float(np.clip(s, 0, 100))
 
 
+# =========================
+# CSV IO
+# =========================
 def save_row_to_csv(row: dict, path: str = RESULTS_PATH):
     df = pd.DataFrame([row])
     if os.path.exists(path):
@@ -671,7 +1029,7 @@ settings = load_settings()
 
 with st.sidebar:
     st.markdown("## 🟣 GRT QuantLab")
-    st.caption("Regímenes · Probabilidades · Fundamentals (fallback automático)")
+    st.caption("Regímenes · Probabilidades · Fundamentals · Noticias")
 
     preferred_exchange = st.selectbox(
         "Exchange preferido (fallback auto)",
@@ -681,6 +1039,13 @@ with st.sidebar:
     symbol = st.text_input("Símbolo", value=settings.get("symbol","GRT/USDT"))
     benchmark = st.text_input("Benchmark", value=settings.get("benchmark","BTC/USDT"))
     days = st.slider("Histórico (días)", 250, 2000, int(settings.get("days", 900)), step=50)
+
+    st.divider()
+    st.markdown("### 📰 Noticias (RSS)")
+    news_cfg = settings.get("news", DEFAULT_SETTINGS["news"])
+    news_enable = st.toggle("Activar noticias", value=bool(news_cfg.get("enable", True)))
+    news_lookback = st.slider("Ventana titular (días)", 3, 30, int(news_cfg.get("lookback_days", 14)))
+    st.caption("Se usa un score 0–100 a partir de titulares recientes (robusto y sin keys).")
 
     st.divider()
     st.markdown("### 🔌 The Graph Gateway (opcional)")
@@ -699,6 +1064,7 @@ with st.sidebar:
         settings["days"] = int(days)
         settings.setdefault("api_keys", {})
         settings["api_keys"]["thegraph_gateway"] = thegraph_key.strip()
+        settings["news"] = {"enable": bool(news_enable), "lookback_days": int(news_lookback), "rss_timeout": int(news_cfg.get("rss_timeout", 15))}
         save_settings(settings)
         st.success("Ajustes guardados.")
 
@@ -709,9 +1075,9 @@ with st.sidebar:
 st.markdown(
     """
     <div class="epic-hero">
-      <div class="epic-title">🟣 GRT QuantLab <span class="badge">Regímenes · Probabilidades · Fundamentals</span></div>
+      <div class="epic-title">🟣 GRT QuantLab <span class="badge">Market · Modelos · Risk · Fundamentals · News</span></div>
       <div class="epic-sub">
-        Arriba: KPIs (Score + P↑ 7/30/90). Abajo: Market · Modelos · Fundamentals · Export.
+        KPIs arriba (Score + P↑ + News). Abajo: velas, métricas, modelos, noticias y export.
       </div>
     </div>
     """,
@@ -732,10 +1098,21 @@ dfb = pd.DataFrame()
 fund = pd.DataFrame()
 fund_source = "N/A"
 score = np.nan
+news_score = np.nan
+news_df = pd.DataFrame()
+
+progress = st.empty()
+status = st.empty()
 
 if run_update:
     try:
+        bar = progress.progress(0, text="Preparando…")
+        status.info("Inicializando…")
+
         tf = settings.get("timeframe","1d")
+
+        bar.progress(10, text="Descargando OHLCV…")
+        status.info("Descargando datos de mercado…")
         df = compute_returns(fetch_ohlcv(preferred_exchange, symbol, tf, limit=int(days)))
         dfb = compute_returns(fetch_ohlcv(preferred_exchange, benchmark, tf, limit=int(days)))
 
@@ -743,7 +1120,8 @@ if run_update:
         used_sym = df.attrs.get("symbol_used", symbol)
         used_bench = dfb.attrs.get("symbol_used", benchmark)
 
-        # Fundamentals: Gateway si hay key, si no CoinGecko
+        bar.progress(25, text="Cargando fundamentals…")
+        status.info("Cargando fundamentals…")
         tgk = settings.get("api_keys", {}).get("thegraph_gateway","").strip()
         if tgk:
             try:
@@ -758,7 +1136,21 @@ if run_update:
 
         fund_last = fund.iloc[-1] if (fund is not None and not fund.empty) else None
 
+        bar.progress(40, text="Noticias (RSS)…")
+        status.info("Leyendo titulares y calculando score…")
+        news_cfg = settings.get("news", DEFAULT_SETTINGS["news"])
+        try:
+            news_score, news_df = build_news_panel(
+                enable=bool(news_cfg.get("enable", True)),
+                lookback_days=int(news_cfg.get("lookback_days", 14)),
+                timeout=int(news_cfg.get("rss_timeout", 15)),
+            )
+        except Exception:
+            news_score, news_df = np.nan, pd.DataFrame()
+
         # Metrics
+        bar.progress(55, text="Calculando métricas…")
+        status.info("Calculando indicadores y riesgo…")
         metrics.update(trend_regression(df, 90))
         metrics.update(stationarity_tests(df))
         metrics.update(momentum_metrics(df))
@@ -766,17 +1158,26 @@ if run_update:
         metrics.update(garch_volatility(df))
         metrics.update(structural_breaks(df))
         metrics.update(tail_risk_metrics(df))
+        metrics.update(extra_market_stats(df, dfb))
+        metrics["news_score_0_100"] = float(news_score) if np.isfinite(news_score) else np.nan
 
-        # HMM robusto (ya no rompe)
+        # HMM
+        bar.progress(65, text="HMM (regímenes)…")
+        status.info("Estimando regímenes…")
         metrics.update(hmm_regimes_robust(df))
 
         # Modelos
-        feat = build_feature_frame(df, dfb, fund_last)
+        bar.progress(78, text="Entrenando modelos…")
+        status.info("Entrenando ensemble + explicabilidad…")
+        feat = build_feature_frame(df, dfb, fund_last, news_score_0_100=news_score)
         probs, report, diag = fit_ensemble_probabilities(feat, horizons=(7,30,90), min_rows=250)
 
+        bar.progress(90, text="Calculando score…")
+        status.info("Cerrando cálculo…")
         score = grt_score(metrics, probs)
 
         if auto_save:
+            bar.progress(95, text="Guardando…")
             row = {
                 "as_of_date": str(df.index.max()),
                 "exchange": used_ex,
@@ -785,6 +1186,7 @@ if run_update:
                 "updated_at_utc": now_utc_iso(),
                 "fund_source": fund_source,
                 "score_0_100": float(score),
+                "news_score_0_100": safe_float(news_score),
                 "p_up_7d": safe_float(probs.get(7)),
                 "p_up_30d": safe_float(probs.get(30)),
                 "p_up_90d": safe_float(probs.get(90)),
@@ -792,29 +1194,30 @@ if run_update:
             }
             save_row_to_csv(row)
 
-        st.success(f"✅ Actualizado ({used_ex} · {used_sym}) — Score: {score:.1f}/100")
-        st.caption(f"Benchmark usado: {dfb.attrs.get('exchange_used', used_ex)} · {used_bench} · Fundamentals: {fund_source}")
+        bar.progress(100, text="Listo ✅")
+        status.success(f"✅ Actualizado ({used_ex} · {used_sym}) — Score: {score:.1f}/100")
+        st.caption(f"Benchmark: {dfb.attrs.get('exchange_used', used_ex)} · {used_bench} · Fundamentals: {fund_source}")
 
-        # Si HMM falló, lo mostramos como warning (pero sin romper)
         hmm_status = metrics.get("hmm_status", "")
         if isinstance(hmm_status, str) and hmm_status.startswith("HMM failed"):
             st.warning(hmm_status)
 
     except Exception as e:
-        st.error(f"Error al actualizar: {e}")
+        status.error(f"Error al actualizar: {e}")
 
-# Si no actualizas, intenta cargar último guardado
+# Si no actualizas, carga último guardado
 hist = load_results()
 if (not run_update) and (not hist.empty):
     last = hist.sort_values("as_of_date").iloc[-1].to_dict()
     score = safe_float(last.get("score_0_100"))
+    news_score = safe_float(last.get("news_score_0_100"))
     probs = {7: safe_float(last.get("p_up_7d")), 30: safe_float(last.get("p_up_30d")), 90: safe_float(last.get("p_up_90d"))}
 
 
 # =========================
-# KPIs ARRIBA (lo que te salía vacío)
+# KPIs ARRIBA
 # =========================
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 
 with c1:
     st.markdown(
@@ -871,6 +1274,19 @@ with c4:
         unsafe_allow_html=True
     )
 
+with c5:
+    st.markdown(
+        f"""
+        <div class='kpi'>
+          <div class='label'>News Score</div>
+          <div class='value'>{_fmt_num(news_score, 1) if np.isfinite(news_score) else "—"}</div>
+          <div class='hint'>0–100 (titulares)</div>
+          <div class='hint'>{explain_news_score(news_score)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 st.write("")
 
 # Gauge
@@ -891,7 +1307,7 @@ st.divider()
 # =========================
 # TABS
 # =========================
-tab1, tab2, tab3, tab4 = st.tabs(["📈 Market", "🧠 Modelos", "🟣 Fundamentals GRT", "🧾 Histórico / Export"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Market", "🧠 Modelos", "🧪 Riesgo & Señales", "📰 Noticias", "🧾 Histórico / Export"])
 
 with tab1:
     st.subheader("Market")
@@ -910,13 +1326,32 @@ with tab1:
         fig_v.update_layout(height=220, margin=dict(l=20,r=20,t=10,b=10), paper_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig_v, use_container_width=True)
 
+        # Extra mini chart: RSI + MACD histogram
+        if len(df) > 60:
+            rsi_s = rsi(df["close"].astype(float), 14)
+            m_line, m_sig, m_hist = macd(df["close"].astype(float))
+            mini = pd.DataFrame({
+                "date": df.index.astype(str),
+                "RSI14": rsi_s.values,
+                "MACD_hist": m_hist.values
+            }).tail(180)
+
+            st.write("")
+            st.markdown("#### Indicadores rápidos")
+            fig_rsi = px.line(mini, x="date", y="RSI14", title="RSI(14) (últimos 180 días)")
+            fig_rsi.update_layout(height=260, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_rsi, use_container_width=True)
+
+            fig_mh = px.bar(mini, x="date", y="MACD_hist", title="MACD Hist (últimos 180 días)")
+            fig_mh.update_layout(height=260, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_mh, use_container_width=True)
+
 with tab2:
     st.subheader("Modelos · Probabilidades + Explicabilidad")
 
     if not report:
         st.info("Pulsa **Actualizar (calcular todo)**.")
     else:
-        # -------- TABLA RESUMEN --------
         rows = []
         for h in [7, 30, 90]:
             rep = report.get(h, {})
@@ -934,7 +1369,6 @@ with tab2:
         st.write("")
         st.markdown("### Interpretación rápida por horizonte")
 
-        # -------- TARJETAS CON EXPLICACIÓN --------
         for h in [7, 30, 90]:
             rep = report.get(h, {})
             p = probs.get(h, np.nan)
@@ -961,12 +1395,7 @@ with tab2:
         st.write("")
         st.markdown("### Factores más influyentes")
 
-        # -------- SELECTOR DE HORIZONTE (A NIVEL CORRECTO) --------
-        h_sel = st.selectbox(
-            "Ver factores top para horizonte",
-            [7, 30, 90],
-            index=1
-        )
+        h_sel = st.selectbox("Ver factores top para horizonte", [7, 30, 90], index=1)
 
         rep_sel = report.get(h_sel, {})
         p_sel = probs.get(h_sel, np.nan)
@@ -985,7 +1414,6 @@ with tab2:
         )
 
         top_feats = rep_sel.get("top_features", [])
-
         if not top_feats:
             st.warning("No se pudo calcular importance (AUC inválido o pocos datos).")
         else:
@@ -997,35 +1425,90 @@ with tab2:
                 orientation="h",
                 title=f"Top factores (perm. importance) — {h_sel}d"
             )
-            fig_imp.update_layout(
-                height=420,
-                margin=dict(l=20, r=20, t=50, b=10),
-                paper_bgcolor="rgba(0,0,0,0)"
-            )
+            fig_imp.update_layout(height=420, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig_imp, use_container_width=True)
 
         st.caption(f"HMM status: {metrics.get('hmm_status','N/A')}")
 
 with tab3:
-    st.subheader("Fundamentals GRT")
-    st.caption(f"Fuente: **{fund_source}**")
-    if fund is None or fund.empty:
-        st.warning("No se pudieron cargar fundamentals (prueba de nuevo).")
+    st.subheader("Riesgo & Señales (interpretación sencilla)")
+
+    if df.empty or not metrics:
+        st.info("Pulsa **Actualizar (calcular todo)**.")
     else:
-        st.dataframe(fund, use_container_width=True)
+        a = metrics.get("ann_return_est", np.nan)
+        v = metrics.get("ann_vol_est", np.nan)
+        dd = metrics.get("max_drawdown", np.nan)
+        var95 = metrics.get("var_95", np.nan)
+        cvar95 = metrics.get("cvar_95", np.nan)
+        sh = metrics.get("sharpe_simple", np.nan)
+        beta = metrics.get("beta_180", np.nan)
+        rv = metrics.get("realized_vol_30", np.nan)
+        rsi14 = metrics.get("rsi_14", np.nan)
+        adx14 = metrics.get("adx_14", np.nan)
+        atr14 = metrics.get("atr_14", np.nan)
+        bbp = metrics.get("bb_pctb", np.nan)
+
+        cA, cB, cC, cD = st.columns(4)
+        with cA:
+            st.markdown(f"<div class='kpi'><div class='label'>Max Drawdown</div><div class='value'>{_fmt_pct(dd)}</div><div class='hint'>Más negativo = peor caída desde máximo. Te dice el “dolor máximo” reciente.</div></div>", unsafe_allow_html=True)
+        with cB:
+            st.markdown(f"<div class='kpi'><div class='label'>VaR 95% (diario)</div><div class='value'>{_fmt_pct(var95)}</div><div class='hint'>Pérdida “típica” en el peor 5% de días. Más negativo = más riesgo de sustos.</div></div>", unsafe_allow_html=True)
+        with cC:
+            st.markdown(f"<div class='kpi'><div class='label'>CVaR 95% (diario)</div><div class='value'>{_fmt_pct(cvar95)}</div><div class='hint'>Media de los peores días (más extremo que VaR). Sirve para medir colas.</div></div>", unsafe_allow_html=True)
+        with cD:
+            st.markdown(f"<div class='kpi'><div class='label'>Sharpe (simple)</div><div class='value'>{_fmt_num(sh,2)}</div><div class='hint'>Retorno por unidad de riesgo. &gt;1 suele ser “decente”, &lt;0 mala relación riesgo/beneficio.</div></div>", unsafe_allow_html=True)
+
+        st.write("")
+        cE, cF, cG, cH = st.columns(4)
+        with cE:
+            st.markdown(f"<div class='kpi'><div class='label'>Beta vs BTC (180d)</div><div class='value'>{_fmt_num(beta,2)}</div><div class='hint'>≈1 se mueve como BTC. &gt;1 se mueve más (más volátil). &lt;1 menos dependencia.</div></div>", unsafe_allow_html=True)
+        with cF:
+            st.markdown(f"<div class='kpi'><div class='label'>Realized Vol (30d)</div><div class='value'>{_fmt_num(rv,3)}</div><div class='hint'>Volatilidad realizada reciente. Más alta = rangos más amplios y más riesgo.</div></div>", unsafe_allow_html=True)
+        with cG:
+            st.markdown(f"<div class='kpi'><div class='label'>RSI(14)</div><div class='value'>{_fmt_num(rsi14,1)}</div><div class='hint'>&lt;30: sobreventa (rebote posible). &gt;70: sobrecompra (riesgo de corrección).</div></div>", unsafe_allow_html=True)
+        with cH:
+            st.markdown(f"<div class='kpi'><div class='label'>ADX(14)</div><div class='value'>{_fmt_num(adx14,1)}</div><div class='hint'>&gt;25 suele indicar tendencia con fuerza. Bajo = rango/lateral.</div></div>", unsafe_allow_html=True)
+
+        st.write("")
+        cI, cJ, cK = st.columns(3)
+        with cI:
+            st.markdown(f"<div class='kpi'><div class='label'>ATR(14)</div><div class='value'>{_fmt_num(atr14,4)}</div><div class='hint'>Rango medio diario. Útil para stops: ATR alto = precio “se mueve más”.</div></div>", unsafe_allow_html=True)
+        with cJ:
+            st.markdown(f"<div class='kpi'><div class='label'>Bollinger %B</div><div class='value'>{_fmt_num(bbp,2)}</div><div class='hint'>≈0: cerca banda baja. ≈1: cerca banda alta. Extremos pueden anticipar reversión o ruptura.</div></div>", unsafe_allow_html=True)
+        with cK:
+            st.markdown(f"<div class='kpi'><div class='label'>Retorno anual (aprox)</div><div class='value'>{_fmt_pct(a)}</div><div class='hint'>Estimación simple con últimos ~365 días. En cripto puede cambiar rápido.</div></div>", unsafe_allow_html=True)
+
+        st.caption("Idea práctica: usa **Riesgo (DD/VaR/CVaR)** + **tendencia (ADX)** + **momento (RSI/MACD)** + **modelo (P↑)** + **news** para confluencia.")
 
 with tab4:
+    st.subheader("Noticias (RSS) · Contexto para el modelo")
+    st.caption("Se usa un score 0–100 basado en titulares recientes. No es “verdad”, es *contexto*.")
+
+    if (news_df is None) or news_df.empty:
+        st.info("No hay titulares disponibles (o RSS desactivado). Pulsa Actualizar.")
+    else:
+        st.markdown(
+            f"<div class='kpi'><div class='label'>News Score (0–100)</div><div class='value'>{_fmt_num(news_score,1)}</div><div class='hint'>{explain_news_score(news_score)}</div></div>",
+            unsafe_allow_html=True
+        )
+        st.write("")
+        show_cols = ["sent_0_100","title","pubDate","link"]
+        df_show = news_df.copy()
+        if "sent_0_100" not in df_show.columns:
+            df_show["sent_0_100"] = (50 + 50*df_show["sent"]).clip(0,100)
+        df_show = df_show[show_cols].head(30)
+        st.dataframe(df_show, use_container_width=True)
+
+        st.caption("Tip: si ves un News Score muy alto pero AUC bajo, puede ser hype sin señal estadística sólida.")
+
+with tab5:
     st.subheader("Histórico / Export")
     if hist.empty:
         st.info("Aún no hay histórico. Activa guardar y pulsa Actualizar.")
     else:
-        st.dataframe(hist.sort_values("as_of_date").tail(60), use_container_width=True)
+        st.dataframe(hist.sort_values("as_of_date").tail(80), use_container_width=True)
         with open(RESULTS_PATH, "rb") as f:
             st.download_button("⬇️ Descargar daily_results.csv", f, file_name="daily_results.csv", mime="text/csv")
 
 st.caption("⚠️ Esto no garantiza subidas. Reduce incertidumbre con confluencia + gestión de riesgo.")
-
-
-
-
-
