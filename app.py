@@ -1,7 +1,7 @@
 import os
 import json
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -22,15 +22,15 @@ from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
 from sklearn.inspection import permutation_importance
 
+import plotly.graph_objects as go
+import plotly.express as px
+
 # HMM opcional
 try:
     from hmmlearn.hmm import GaussianHMM
     HMM_AVAILABLE = True
 except Exception:
     HMM_AVAILABLE = False
-
-import plotly.graph_objects as go
-import plotly.express as px
 
 
 # =========================
@@ -45,8 +45,7 @@ SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
 
 FALLBACK_EXCHANGES = ["kraken", "coinbase", "bitstamp"]
 
-# Subgraph ID de "Graph Network Mainnet" (desde Explorer)
-# Fuente: Graph Explorer muestra Query URL /subgraphs/id/<ID> :contentReference[oaicite:2]{index=2}
+# (Si algún día usas Gateway) - mantenemos por compatibilidad
 GRAPH_NETWORK_SUBGRAPH_ID = "GgwLf9BTFBJi6Z5iYHssMAGEE4w5dR3Jox2dMLrBxnCT"
 
 DEFAULT_SETTINGS = {
@@ -56,7 +55,7 @@ DEFAULT_SETTINGS = {
     "days": 900,
     "timeframe": "1d",
     "api_keys": {
-        "thegraph_gateway": ""   # <-- pon aquí tu API key del Graph Gateway
+        "thegraph_gateway": ""   # opcional
     }
 }
 
@@ -70,9 +69,13 @@ EPIC_CSS = """
   --bg0:#070A12;
   --bg1:#0B1020;
   --card:#0F1730;
+  --card2:#101B3B;
   --text:#E8EEFF;
   --muted:#AAB6E8;
   --accent:#A855F7;
+  --accent2:#22C55E;
+  --warn:#F59E0B;
+  --bad:#EF4444;
   --line:#1E2A55;
 }
 html, body, [class*="css"]  {
@@ -87,7 +90,8 @@ section[data-testid="stSidebar"]{
 }
 .block-container{ padding-top: 1.1rem; }
 .epic-hero{
-  padding: 18px 18px; border-radius: 18px;
+  padding: 18px 18px;
+  border-radius: 18px;
   background: linear-gradient(135deg, rgba(168,85,247,0.20), rgba(34,197,94,0.08));
   border: 1px solid rgba(30,42,85,0.7);
   box-shadow: 0 18px 60px rgba(0,0,0,0.35);
@@ -95,7 +99,8 @@ section[data-testid="stSidebar"]{
 .epic-title{ font-size: 26px; font-weight: 800; letter-spacing: -0.3px; }
 .epic-sub{ color: var(--muted); font-size: 14px; }
 .kpi{
-  border-radius: 16px; padding: 14px 14px;
+  border-radius: 16px;
+  padding: 14px 14px;
   background: linear-gradient(180deg, rgba(15,23,48,0.95), rgba(16,27,59,0.85));
   border: 1px solid rgba(30,42,85,0.7);
 }
@@ -103,10 +108,14 @@ section[data-testid="stSidebar"]{
 .kpi .value{ font-size: 20px; font-weight: 800; }
 .kpi .hint{ color: var(--muted); font-size: 11px; margin-top: 6px; }
 .badge{
-  display:inline-block; padding: 4px 10px; border-radius: 999px;
+  display:inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
   background: rgba(168,85,247,0.15);
   border:1px solid rgba(168,85,247,0.35);
-  color: var(--text); font-size: 12px; margin-left: 8px;
+  color: var(--text);
+  font-size: 12px;
+  margin-left: 8px;
 }
 </style>
 """
@@ -119,7 +128,6 @@ st.markdown(EPIC_CSS, unsafe_allow_html=True)
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-
 def load_settings() -> dict:
     if not os.path.exists(SETTINGS_PATH):
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
@@ -128,21 +136,30 @@ def load_settings() -> dict:
     with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 def save_settings(s: dict) -> None:
     with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
         json.dump(s, f, indent=2, ensure_ascii=False)
 
+def safe_float(x):
+    try:
+        if x is None:
+            return np.nan
+        v = float(x)
+        if np.isinf(v):
+            return np.nan
+        return v
+    except Exception:
+        return np.nan
 
 def _symbol_variants(symbol: str):
     base, quote = symbol.split("/")
     variants = [symbol]
+    # fallback si USDT no existe
     if quote.upper() == "USDT":
         variants += [f"{base}/USD", f"{base}/USDC"]
     return variants
 
-
-@st.cache_data(ttl=60 * 60)
+@st.cache_data(ttl=60*60)
 def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     exchanges_to_try = [exchange_id] + [ex for ex in FALLBACK_EXCHANGES if ex != exchange_id]
     last_err = None
@@ -169,12 +186,12 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, limit: int) -> pd
         except Exception as e:
             last_err = e
             msg = str(e).lower()
+            # errores típicos por región/restricción
             if ("451" in msg) or ("restricted location" in msg) or ("eligibility" in msg):
                 continue
             continue
 
     raise RuntimeError(f"No se pudo descargar OHLCV. Último error: {last_err}")
-
 
 def compute_returns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -186,34 +203,43 @@ def compute_returns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def safe_float(x):
-    try:
-        if x is None:
-            return np.nan
-        v = float(x)
-        if np.isinf(v):
-            return np.nan
-        return v
-    except Exception:
-        return np.nan
+# =========================
+# FUNDAMENTALS (SIN WALLET) - CoinGecko fallback
+# =========================
+@st.cache_data(ttl=6*60*60)
+def fetch_grt_fundamentals_coingecko() -> pd.DataFrame:
+    url = "https://api.coingecko.com/api/v3/coins/the-graph"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    d = r.json()
+
+    m = d.get("market_data", {})
+    row = {
+        "as_of": str(pd.Timestamp.utcnow().date()),
+        "cg_price_usd": safe_float(m.get("current_price", {}).get("usd")),
+        "cg_marketcap_usd": safe_float(m.get("market_cap", {}).get("usd")),
+        "cg_volume_24h_usd": safe_float(m.get("total_volume", {}).get("usd")),
+        "cg_circulating_supply": safe_float(m.get("circulating_supply")),
+        "cg_total_supply": safe_float(m.get("total_supply")),
+        "cg_max_supply": safe_float(m.get("max_supply")),
+        "cg_price_change_24h_pct": safe_float(m.get("price_change_percentage_24h")),
+        "cg_price_change_7d_pct": safe_float(m.get("price_change_percentage_7d")),
+        "cg_price_change_30d_pct": safe_float(m.get("price_change_percentage_30d")),
+    }
+    return pd.DataFrame([row]).set_index("as_of")
 
 
+# (Opcional) Gateway – si lo usas algún día
 def _graphql_post(url: str, query: str, variables=None, timeout=25) -> dict:
     payload = {"query": query, "variables": variables or {}}
     r = requests.post(url, json=payload, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
-
-@st.cache_data(ttl=6 * 60 * 60)
-def fetch_grt_network_fundamentals(thegraph_api_key: str) -> pd.DataFrame:
-    """
-    Usa Graph Gateway:
-    https://gateway.thegraph.com/api/<KEY>/subgraphs/id/<SUBGRAPH_ID> :contentReference[oaicite:3]{index=3}
-    """
+@st.cache_data(ttl=6*60*60)
+def fetch_grt_network_fundamentals_gateway(thegraph_api_key: str) -> pd.DataFrame:
     if not thegraph_api_key:
         raise RuntimeError("Falta THE_GRAPH_API_KEY (Gateway).")
-
     url = f"https://gateway.thegraph.com/api/{thegraph_api_key}/subgraphs/id/{GRAPH_NETWORK_SUBGRAPH_ID}"
 
     q = """
@@ -224,15 +250,10 @@ def fetch_grt_network_fundamentals(thegraph_api_key: str) -> pd.DataFrame:
         totalTokensAllocated
         totalDelegatedTokens
         totalSupply
-        totalQueryFees
-        totalIndexerRewards
-        totalDelegationRewards
       }
       indexers(first: 1000, where: {active: true}) { id }
-      delegators(first: 1000) { id }
     }
     """
-
     data = _graphql_post(url, q)
     if "errors" in data:
         raise RuntimeError(f"Graph gateway error: {data['errors']}")
@@ -240,19 +261,12 @@ def fetch_grt_network_fundamentals(thegraph_api_key: str) -> pd.DataFrame:
     d = data["data"]
     gn = d.get("graphNetwork") or {}
     idx_count = len(d.get("indexers") or [])
-    del_count = len(d.get("delegators") or [])
 
     row = {
         "as_of": str(pd.Timestamp.utcnow().date()),
         "totalTokensStaked": safe_float(gn.get("totalTokensStaked")),
-        "totalTokensAllocated": safe_float(gn.get("totalTokensAllocated")),
-        "totalDelegatedTokens": safe_float(gn.get("totalDelegatedTokens")),
         "totalSupply": safe_float(gn.get("totalSupply")),
-        "totalQueryFees": safe_float(gn.get("totalQueryFees")),
-        "totalIndexerRewards": safe_float(gn.get("totalIndexerRewards")),
-        "totalDelegationRewards": safe_float(gn.get("totalDelegationRewards")),
         "activeIndexers": float(idx_count),
-        "delegatorsApprox": float(del_count),
     }
     return pd.DataFrame([row]).set_index("as_of")
 
@@ -262,26 +276,21 @@ def fetch_grt_network_fundamentals(thegraph_api_key: str) -> pd.DataFrame:
 # =========================
 def trend_regression(df: pd.DataFrame, window: int = 90) -> dict:
     d = df.dropna().tail(window).copy()
+    if len(d) < 30:
+        return {"trend_slope": np.nan, "trend_pvalue": np.nan, "trend_r2": np.nan}
     y = d["log_close"].values
     x = np.arange(len(d))
     X = sm.add_constant(x)
     model = sm.OLS(y, X).fit()
-    return {
-        "trend_slope": float(model.params[1]),
-        "trend_pvalue": float(model.pvalues[1]),
-        "trend_r2": float(model.rsquared),
-    }
-
+    return {"trend_slope": float(model.params[1]), "trend_pvalue": float(model.pvalues[1]), "trend_r2": float(model.rsquared)}
 
 def stationarity_tests(df: pd.DataFrame) -> dict:
     d = df["log_ret"].dropna()
+    if len(d) < 120:
+        return {"adf_pvalue": np.nan, "kpss_pvalue": np.nan}
     adf = adfuller(d, autolag="AIC")
     kpss_stat, kpss_p, _, _ = kpss(d, regression="c", nlags="auto")
-    return {
-        "adf_pvalue": float(adf[1]),
-        "kpss_pvalue": float(kpss_p),
-    }
-
+    return {"adf_pvalue": float(adf[1]), "kpss_pvalue": float(kpss_p)}
 
 def momentum_metrics(df: pd.DataFrame) -> dict:
     r = df["ret"].dropna()
@@ -289,14 +298,14 @@ def momentum_metrics(df: pd.DataFrame) -> dict:
     r90 = float((1 + r.tail(90)).prod() - 1) if len(r) >= 90 else np.nan
     return {"mom_ret_30d": r30, "mom_ret_90d": r90}
 
-
 def volume_signal(df: pd.DataFrame) -> dict:
     v = df["volume"]
     hist = v.tail(180)
+    if len(hist) < 60:
+        return {"vol_z_14d": np.nan}
     recent = v.tail(14).mean()
-    z = float((recent - hist.mean()) / (hist.std() + 1e-12)) if len(hist) > 30 else np.nan
+    z = float((recent - hist.mean()) / (hist.std() + 1e-12))
     return {"vol_z_14d": z}
-
 
 def garch_volatility(df: pd.DataFrame) -> dict:
     r = df["ret"].dropna() * 100.0
@@ -305,7 +314,6 @@ def garch_volatility(df: pd.DataFrame) -> dict:
     am = arch_model(r, vol="Garch", p=1, q=1, mean="Zero", dist="normal")
     res = am.fit(disp="off")
     return {"garch_vol_now": float(res.conditional_volatility.iloc[-1])}
-
 
 def tail_risk_metrics(df: pd.DataFrame) -> dict:
     r = df["ret"].dropna()
@@ -316,49 +324,86 @@ def tail_risk_metrics(df: pd.DataFrame) -> dict:
     return {
         "skew_90d": float(w.skew()),
         "kurt_90d": float(w.kurt()),
-        "downside_vol_90d": float(downside.std()) if len(downside) > 10 else np.nan,
+        "downside_vol_90d": float(downside.std()) if len(downside) > 10 else np.nan
     }
-
 
 def structural_breaks(df: pd.DataFrame) -> dict:
     y = df["log_close"].dropna().values
     if len(y) < 180:
-        return {"breakpoints_n": np.nan}
+        return {"breakpoints_n": np.nan, "break_recent": np.nan}
     algo = rpt.Pelt(model="rbf").fit(y)
     bkps = algo.predict(pen=8)
-    return {"breakpoints_n": float(max(0, len(bkps) - 1))}
-
-
-def hmm_regimes(df: pd.DataFrame) -> dict:
-    if not HMM_AVAILABLE:
-        return {"hmm_regime": None, "hmm_p_regime": np.nan}
-
-    r = df["ret"].dropna()
-    if len(r) < 400:
-        return {"hmm_regime": None, "hmm_p_regime": np.nan}
-
-    vol = r.rolling(14).std()
-    x = pd.concat([r, vol], axis=1).dropna()
-    X = x.values
-
-    model = GaussianHMM(n_components=3, covariance_type="full", n_iter=250, random_state=7)
-    model.fit(X)
-
-    post = model.predict_proba(X)
-    current_state = int(np.argmax(post[-1]))
-    p_state = float(np.max(post[-1]))
-
-    states = model.predict(X)
-    means = []
-    for s in range(3):
-        means.append(float(np.mean(r.loc[x.index][states == s])))
-    order = np.argsort(means)
-    label_map = {int(order[0]): "Dump / Risk", int(order[1]): "Range / Accum", int(order[2]): "Uptrend"}
-    return {"hmm_regime": label_map.get(current_state, "Unknown"), "hmm_p_regime": p_state}
+    b = bkps[:-1]
+    recent = any((len(y) - bp) <= 30 for bp in b) if len(b) else False
+    return {"breakpoints_n": float(len(b)), "break_recent": float(1.0 if recent else 0.0)}
 
 
 # =========================
-# FEATURES + MODELOS (FIX)
+# HMM (ROBUSTO) - FIX del error covars
+# =========================
+def hmm_regimes_robust(df: pd.DataFrame) -> dict:
+    """
+    Evita el error: 'covars' must be symmetric, positive-definite
+    usando:
+      - limpieza NaN/inf
+      - estandarización
+      - covariance_type='diag' (más estable)
+      - try/except (no rompe la app)
+    """
+    if not HMM_AVAILABLE:
+        return {"hmm_regime": None, "hmm_p_regime": np.nan, "hmm_status": "HMM not installed"}
+
+    r = df["ret"].dropna()
+    if len(r) < 250:
+        return {"hmm_regime": None, "hmm_p_regime": np.nan, "hmm_status": "Not enough data"}
+
+    vol = r.rolling(14).std()
+    X = pd.concat([r.rename("ret"), vol.rename("vol")], axis=1)
+    X = X.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(X) < 200:
+        return {"hmm_regime": None, "hmm_p_regime": np.nan, "hmm_status": "Not enough clean rows"}
+
+    # Estandarizar
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X.values)
+
+    # Jitter mínimo por estabilidad numérica (si hay var ~0)
+    Xs = Xs + np.random.normal(0, 1e-8, size=Xs.shape)
+
+    try:
+        model = GaussianHMM(
+            n_components=3,
+            covariance_type="diag",   # <- MUCHO más estable que 'full'
+            n_iter=300,
+            random_state=7
+        )
+        model.fit(Xs)
+
+        post = model.predict_proba(Xs)
+        current_state = int(np.argmax(post[-1]))
+        p_state = float(np.max(post[-1]))
+
+        # Etiquetado por retorno medio de cada estado (en escala original)
+        states = model.predict(Xs)
+        means = []
+        r_aligned = X["ret"].values
+        for s in range(3):
+            means.append(float(np.mean(r_aligned[states == s])))
+
+        order = np.argsort(means)  # low -> high
+        label_map = {int(order[0]): "Dump / Risk", int(order[1]): "Range / Accum", int(order[2]): "Uptrend"}
+        label = label_map.get(current_state, "Unknown")
+
+        return {"hmm_regime": label, "hmm_p_regime": p_state, "hmm_status": "OK"}
+
+    except Exception as e:
+        # No rompemos la app
+        return {"hmm_regime": None, "hmm_p_regime": np.nan, "hmm_status": f"HMM failed: {e}"}
+
+
+# =========================
+# FEATURES + MODELOS (para que P↑ no se quede vacío)
 # =========================
 def build_feature_frame(df: pd.DataFrame, bench: pd.DataFrame, fund_last: Optional[pd.Series]) -> pd.DataFrame:
     d = df.copy()
@@ -371,32 +416,32 @@ def build_feature_frame(df: pd.DataFrame, bench: pd.DataFrame, fund_last: Option
     d["mom_30"] = (1 + d["ret"]).rolling(30).apply(lambda x: np.prod(1 + x) - 1, raw=False)
     d["vol_z_14"] = (d["volume"].rolling(14).mean() - d["volume"].rolling(180).mean()) / (d["volume"].rolling(180).std() + 1e-12)
 
-    # Correlación robusta (merge por índice)
+    # correlación robusta por índice (si el benchmark tiene fechas diferentes, saldrán NaN al principio, pero no destruye todo)
     tmp = pd.concat([d["ret"].rename("asset"), bench["ret"].rename("bench")], axis=1)
     d["corr_60"] = tmp["asset"].rolling(60).corr(tmp["bench"])
 
     d["skew_90"] = d["ret"].rolling(90).skew()
     d["kurt_90"] = d["ret"].rolling(90).kurt()
 
-    # Fundamentals (as-of)
+    # fundamentals (as-of) -> lo “broadcast”
     if fund_last is not None and not fund_last.empty:
         for k, v in fund_last.to_dict().items():
             d[f"fund_{k}"] = safe_float(v)
-        ts = d.get("fund_totalTokensStaked")
-        sup = d.get("fund_totalSupply")
-        if ts is not None and sup is not None:
+
+        # si tenemos supply/marketcap/circulating, creamos ratios útiles
+        if "fund_cg_marketcap_usd" in d.columns and "fund_cg_volume_24h_usd" in d.columns:
+            d["fund_mcap_to_vol"] = d["fund_cg_marketcap_usd"] / (d["fund_cg_volume_24h_usd"] + 1e-12)
+
+        if "fund_totalTokensStaked" in d.columns and "fund_totalSupply" in d.columns:
             d["fund_stake_ratio"] = d["fund_totalTokensStaked"] / (d["fund_totalSupply"] + 1e-12)
+
+        if "fund_cg_circulating_supply" in d.columns and "fund_cg_total_supply" in d.columns:
+            d["fund_circ_ratio"] = d["fund_cg_circulating_supply"] / (d["fund_cg_total_supply"] + 1e-12)
 
     return d
 
 
 def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_rows=250) -> Tuple[dict, dict, dict]:
-    """
-    FIXES:
-    - imputa NaNs (ffill/bfill) para evitar dataset vacío
-    - baja el mínimo de filas a min_rows
-    - devuelve diagnóstico de tamaños reales
-    """
     feat = feat.copy()
 
     drop_cols = {"open","high","low","close","volume","log_close","ret","log_ret"}
@@ -404,7 +449,8 @@ def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_row
 
     X_all = feat[candidates].apply(pd.to_numeric, errors="coerce")
     X_all = X_all.replace([np.inf, -np.inf], np.nan)
-    X_all = X_all.ffill().bfill()  # <- clave para que no se quede en 0
+    # clave: no reventar el dataset
+    X_all = X_all.ffill().bfill()
 
     probs = {}
     report = {}
@@ -434,7 +480,7 @@ def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_row
 
         logit = Pipeline([
             ("scaler", StandardScaler(with_mean=False)),
-            ("clf", LogisticRegression(max_iter=500, n_jobs=1))
+            ("clf", LogisticRegression(max_iter=600, n_jobs=1))
         ])
         gbt = GradientBoostingClassifier(random_state=7)
 
@@ -451,7 +497,7 @@ def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_row
         p_today = 0.5 * logit.predict_proba(last_row)[:, 1][0] + 0.5 * gbt.predict_proba(last_row)[:, 1][0]
         probs[h] = float(p_today)
 
-        # Explainability
+        # explainability
         try:
             imp = permutation_importance(gbt, X_test, y_test, n_repeats=7, random_state=7, scoring="roc_auc")
             imp_df = pd.DataFrame({"feature": X_test.columns, "importance": imp.importances_mean})
@@ -465,6 +511,9 @@ def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_row
     return probs, report, diag
 
 
+# =========================
+# SCORE
+# =========================
 def grt_score(metrics: dict, probs: dict) -> float:
     s = 50.0
 
@@ -496,18 +545,16 @@ def grt_score(metrics: dict, probs: dict) -> float:
     if skew == skew:
         s += 4 if skew > 0.2 else (-4 if skew < -0.2 else 0)
 
-    regime = metrics.get("hmm_regime", None)
-    p_reg = metrics.get("hmm_p_regime", np.nan)
-    if regime and isinstance(regime, str):
-        if "Uptrend" in regime:
-            s += 8 if (p_reg == p_reg and p_reg > 0.6) else 5
-        elif "Dump" in regime:
+    # HMM (si está)
+    reg = metrics.get("hmm_regime", None)
+    pr = metrics.get("hmm_p_regime", np.nan)
+    if isinstance(reg, str):
+        if "Uptrend" in reg:
+            s += 8 if (pr == pr and pr > 0.6) else 5
+        elif "Dump" in reg:
             s -= 8
 
-    stake_ratio = metrics.get("fund_stake_ratio", np.nan)
-    if stake_ratio == stake_ratio:
-        s += 6 if stake_ratio > 0.35 else (3 if stake_ratio > 0.25 else 0)
-
+    # Probabilities
     p30 = probs.get(30, np.nan)
     p90 = probs.get(90, np.nan)
     if p30 == p30:
@@ -528,7 +575,6 @@ def save_row_to_csv(row: dict, path: str = RESULTS_PATH):
         out = df
     out.to_csv(path, index=False)
 
-
 def load_results(path: str = RESULTS_PATH) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
@@ -542,7 +588,7 @@ settings = load_settings()
 
 with st.sidebar:
     st.markdown("## 🟣 GRT QuantLab")
-    st.caption("Regímenes · Probabilidades · Fundamentals (Gateway)")
+    st.caption("Regímenes · Probabilidades · Fundamentals (fallback automático)")
 
     preferred_exchange = st.selectbox(
         "Exchange preferido (fallback auto)",
@@ -554,11 +600,12 @@ with st.sidebar:
     days = st.slider("Histórico (días)", 250, 2000, int(settings.get("days", 900)), step=50)
 
     st.divider()
-    st.markdown("### 🔌 The Graph Gateway")
-    st.caption("Necesitas API key para que carguen los fundamentals.")
+    st.markdown("### 🔌 The Graph Gateway (opcional)")
+    st.caption("Si no tienes key, usamos CoinGecko automáticamente.")
     api_keys = settings.get("api_keys", {})
     thegraph_key = st.text_input("THE_GRAPH_API_KEY", value=api_keys.get("thegraph_gateway",""), type="password")
 
+    st.divider()
     auto_save = st.toggle("Guardar resultado al actualizar", value=True)
     run_update = st.button("🔄 Actualizar (calcular todo)", type="primary")
 
@@ -581,25 +628,26 @@ st.markdown(
     <div class="epic-hero">
       <div class="epic-title">🟣 GRT QuantLab <span class="badge">Regímenes · Probabilidades · Fundamentals</span></div>
       <div class="epic-sub">
-        Modelos (7/30/90) + explicabilidad + fundamentals de red via Graph Gateway.
+        Arriba: KPIs (Score + P↑ 7/30/90). Abajo: Market · Modelos · Fundamentals · Export.
       </div>
     </div>
     """,
     unsafe_allow_html=True
 )
-
 st.write("")
 
+
 # =========================
-# COMPUTE
+# RUN
 # =========================
-metrics = {}
+metrics: Dict[str, object] = {}
 probs = {7: np.nan, 30: np.nan, 90: np.nan}
 report = {}
 diag = {}
 df = pd.DataFrame()
 dfb = pd.DataFrame()
 fund = pd.DataFrame()
+fund_source = "N/A"
 score = np.nan
 
 if run_update:
@@ -612,12 +660,20 @@ if run_update:
         used_sym = df.attrs.get("symbol_used", symbol)
         used_bench = dfb.attrs.get("symbol_used", benchmark)
 
-        # Fundamentals (Gateway)
-        try:
-            fund = fetch_grt_network_fundamentals(settings.get("api_keys", {}).get("thegraph_gateway",""))
-        except Exception as fe:
-            fund = pd.DataFrame()
-            st.warning(f"Fundamentals no disponibles: {fe}")
+        # Fundamentals: Gateway si hay key, si no CoinGecko
+        tgk = settings.get("api_keys", {}).get("thegraph_gateway","").strip()
+        if tgk:
+            try:
+                fund = fetch_grt_network_fundamentals_gateway(tgk)
+                fund_source = "Graph Gateway"
+            except Exception as fe:
+                fund = fetch_grt_fundamentals_coingecko()
+                fund_source = f"CoinGecko (fallback: {fe})"
+        else:
+            fund = fetch_grt_fundamentals_coingecko()
+            fund_source = "CoinGecko (sin wallet)"
+
+        fund_last = fund.iloc[-1] if (fund is not None and not fund.empty) else None
 
         # Metrics
         metrics.update(trend_regression(df, 90))
@@ -627,18 +683,13 @@ if run_update:
         metrics.update(garch_volatility(df))
         metrics.update(structural_breaks(df))
         metrics.update(tail_risk_metrics(df))
-        metrics.update(hmm_regimes(df))
 
-        fund_last = fund.iloc[-1] if (fund is not None and not fund.empty) else None
+        # HMM robusto (ya no rompe)
+        metrics.update(hmm_regimes_robust(df))
+
+        # Modelos
         feat = build_feature_frame(df, dfb, fund_last)
         probs, report, diag = fit_ensemble_probabilities(feat, horizons=(7,30,90), min_rows=250)
-
-        # ratio stake
-        if fund_last is not None:
-            ts = safe_float(fund_last.get("totalTokensStaked"))
-            sup = safe_float(fund_last.get("totalSupply"))
-            if ts == ts and sup == sup:
-                metrics["fund_stake_ratio"] = float(ts / (sup + 1e-12))
 
         score = grt_score(metrics, probs)
 
@@ -649,6 +700,7 @@ if run_update:
                 "symbol": used_sym,
                 "benchmark": used_bench,
                 "updated_at_utc": now_utc_iso(),
+                "fund_source": fund_source,
                 "score_0_100": float(score),
                 "p_up_7d": safe_float(probs.get(7)),
                 "p_up_30d": safe_float(probs.get(30)),
@@ -658,30 +710,48 @@ if run_update:
             save_row_to_csv(row)
 
         st.success(f"✅ Actualizado ({used_ex} · {used_sym}) — Score: {score:.1f}/100")
-        st.caption(f"Benchmark usado: {dfb.attrs.get('exchange_used', used_ex)} · {used_bench}")
+        st.caption(f"Benchmark usado: {dfb.attrs.get('exchange_used', used_ex)} · {used_bench} · Fundamentals: {fund_source}")
+
+        # Si HMM falló, lo mostramos como warning (pero sin romper)
+        hmm_status = metrics.get("hmm_status", "")
+        if isinstance(hmm_status, str) and hmm_status.startswith("HMM failed"):
+            st.warning(hmm_status)
 
     except Exception as e:
         st.error(f"Error al actualizar: {e}")
 
-# Si no actualizas, mostramos último guardado
+# Si no actualizas, intenta cargar último guardado
 hist = load_results()
 if (not run_update) and (not hist.empty):
     last = hist.sort_values("as_of_date").iloc[-1].to_dict()
     score = safe_float(last.get("score_0_100"))
     probs = {7: safe_float(last.get("p_up_7d")), 30: safe_float(last.get("p_up_30d")), 90: safe_float(last.get("p_up_90d"))}
 
+
 # =========================
-# KPIs
+# KPIs ARRIBA (lo que te salía vacío)
 # =========================
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.markdown(f"<div class='kpi'><div class='label'>GRT Score</div><div class='value'>{(score if score==score else np.nan):.1f}/100</div><div class='hint'>Confluencia</div></div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='kpi'><div class='label'>GRT Score</div><div class='value'>{(score if score==score else np.nan):.1f}/100</div><div class='hint'>Confluencia</div></div>",
+        unsafe_allow_html=True
+    )
 with c2:
-    st.markdown(f"<div class='kpi'><div class='label'>P(↑ 7 días)</div><div class='value'>{(probs.get(7)*100 if probs.get(7)==probs.get(7) else np.nan):.1f}%</div><div class='hint'>Ensemble</div></div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='kpi'><div class='label'>P(↑ 7 días)</div><div class='value'>{(probs.get(7)*100 if probs.get(7)==probs.get(7) else np.nan):.1f}%</div><div class='hint'>Ensemble</div></div>",
+        unsafe_allow_html=True
+    )
 with c3:
-    st.markdown(f"<div class='kpi'><div class='label'>P(↑ 30 días)</div><div class='value'>{(probs.get(30)*100 if probs.get(30)==probs.get(30) else np.nan):.1f}%</div><div class='hint'>Ensemble</div></div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='kpi'><div class='label'>P(↑ 30 días)</div><div class='value'>{(probs.get(30)*100 if probs.get(30)==probs.get(30) else np.nan):.1f}%</div><div class='hint'>Ensemble</div></div>",
+        unsafe_allow_html=True
+    )
 with c4:
-    st.markdown(f"<div class='kpi'><div class='label'>P(↑ 90 días)</div><div class='value'>{(probs.get(90)*100 if probs.get(90)==probs.get(90) else np.nan):.1f}%</div><div class='hint'>Ensemble</div></div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='kpi'><div class='label'>P(↑ 90 días)</div><div class='value'>{(probs.get(90)*100 if probs.get(90)==probs.get(90) else np.nan):.1f}%</div><div class='hint'>Ensemble</div></div>",
+        unsafe_allow_html=True
+    )
 
 st.write("")
 
@@ -699,11 +769,16 @@ if score == score:
 
 st.divider()
 
+
+# =========================
+# TABS
+# =========================
 tab1, tab2, tab3, tab4 = st.tabs(["📈 Market", "🧠 Modelos", "🟣 Fundamentals GRT", "🧾 Histórico / Export"])
 
 with tab1:
+    st.subheader("Market")
     if df.empty:
-        st.info("Pulsa **Actualizar**.")
+        st.info("Pulsa **Actualizar (calcular todo)**.")
     else:
         cd = df.reset_index()
         fig_c = go.Figure(data=[go.Candlestick(
@@ -712,10 +787,15 @@ with tab1:
         fig_c.update_layout(height=420, margin=dict(l=20,r=20,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig_c, use_container_width=True)
 
+        fig_v = go.Figure()
+        fig_v.add_trace(go.Bar(x=cd["date"], y=cd["volume"]))
+        fig_v.update_layout(height=220, margin=dict(l=20,r=20,t=10,b=10), paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_v, use_container_width=True)
+
 with tab2:
     st.subheader("Modelos · Probabilidades + Explicabilidad")
     if not report:
-        st.info("Pulsa **Actualizar**.")
+        st.info("Pulsa **Actualizar (calcular todo)**.")
     else:
         rows = []
         for h in [7,30,90]:
@@ -741,20 +821,24 @@ with tab2:
             fig_imp.update_layout(height=420, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig_imp, use_container_width=True)
 
+        st.write("")
+        st.caption(f"HMM status: {metrics.get('hmm_status','N/A')}")
+
 with tab3:
-    st.subheader("Fundamentals GRT · Graph Network (Gateway)")
+    st.subheader("Fundamentals GRT")
+    st.caption(f"Fuente: **{fund_source}**")
     if fund is None or fund.empty:
-        st.warning("No se pudieron cargar fundamentals. Añade THE_GRAPH_API_KEY en el sidebar y pulsa Actualizar.")
+        st.warning("No se pudieron cargar fundamentals (prueba de nuevo).")
     else:
         st.dataframe(fund, use_container_width=True)
 
 with tab4:
     st.subheader("Histórico / Export")
     if hist.empty:
-        st.info("Aún no hay histórico.")
+        st.info("Aún no hay histórico. Activa guardar y pulsa Actualizar.")
     else:
         st.dataframe(hist.sort_values("as_of_date").tail(60), use_container_width=True)
         with open(RESULTS_PATH, "rb") as f:
             st.download_button("⬇️ Descargar daily_results.csv", f, file_name="daily_results.csv", mime="text/csv")
 
-st.caption("⚠️ Panel probabilístico. No garantiza nada. La clave para GRT es combinar precio + fundamentals de red + riesgo.")
+st.caption("⚠️ Esto no garantiza subidas. Reduce incertidumbre con confluencia + gestión de riesgo.")
