@@ -912,11 +912,13 @@ with tab1:
 
 with tab2:
     st.subheader("Modelos · Probabilidades + Explicabilidad")
+
     if not report:
         st.info("Pulsa **Actualizar (calcular todo)**.")
     else:
+        # -------- TABLA RESUMEN --------
         rows = []
-        for h in [7,30,90]:
+        for h in [7, 30, 90]:
             rep = report.get(h, {})
             rows.append({
                 "Horizonte": f"{h} días",
@@ -926,42 +928,82 @@ with tab2:
                 "N test": rep.get("n_test", 0),
                 "Rows clean": diag.get(h, {}).get("rows_after_clean", 0),
             })
+
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
-st.write("")
-st.markdown("### Interpretación rápida por horizonte")
-
-for h in [7, 30, 90]:
-    rep = report.get(h, {})
-    p = probs.get(h, np.nan)
-    auc = rep.get("auc", np.nan)
-    n_train = rep.get("n_train", 0)
-    n_test = rep.get("n_test", 0)
-    rows_clean = diag.get(h, {}).get("rows_after_clean", 0)
-
-    text = model_summary_text(p, auc, n_train, n_test, rows_clean, h)
-
-    st.markdown(
-        f"""
-        <div class='kpi'>
-          <div class='label'>Horizonte {h} días</div>
-          <div class='value'>P(↑) {_fmt_pct(p)} · AUC {(auc if np.isfinite(auc) else np.nan):.3f}</div>
-          <div class='hint'>{text}</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-        h_sel = st.selectbox("Ver factores top para horizonte", [7,30,90], index=1)
-        top_feats = report.get(h_sel, {}).get("top_features", [])
-        if not top_feats:
-            st.warning("No se pudo calcular importance (si AUC inválido o pocos datos).")
-        else:
-            imp_df = pd.DataFrame(top_feats, columns=["feature","importance"])
-            fig_imp = px.bar(imp_df, x="importance", y="feature", orientation="h",
-                             title=f"Top factores (perm. importance) — {h_sel}d")
-            fig_imp.update_layout(height=420, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig_imp, use_container_width=True)
 
         st.write("")
+        st.markdown("### Interpretación rápida por horizonte")
+
+        # -------- TARJETAS CON EXPLICACIÓN --------
+        for h in [7, 30, 90]:
+            rep = report.get(h, {})
+            p = probs.get(h, np.nan)
+            auc = rep.get("auc", np.nan)
+            n_train = rep.get("n_train", 0)
+            n_test = rep.get("n_test", 0)
+            rows_clean = diag.get(h, {}).get("rows_after_clean", 0)
+
+            text = model_summary_text(p, auc, n_train, n_test, rows_clean, h)
+
+            st.markdown(
+                f"""
+                <div class='kpi'>
+                  <div class='label'>Horizonte {h} días</div>
+                  <div class='value'>
+                    P(↑) {_fmt_pct(p)} · AUC {(auc if np.isfinite(auc) else np.nan):.3f}
+                  </div>
+                  <div class='hint'>{text}</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        st.write("")
+        st.markdown("### Factores más influyentes")
+
+        # -------- SELECTOR DE HORIZONTE (A NIVEL CORRECTO) --------
+        h_sel = st.selectbox(
+            "Ver factores top para horizonte",
+            [7, 30, 90],
+            index=1
+        )
+
+        rep_sel = report.get(h_sel, {})
+        p_sel = probs.get(h_sel, np.nan)
+        auc_sel = rep_sel.get("auc", np.nan)
+        rows_sel = diag.get(h_sel, {}).get("rows_after_clean", 0)
+
+        st.info(
+            model_summary_text(
+                p_sel,
+                auc_sel,
+                rep_sel.get("n_train", 0),
+                rep_sel.get("n_test", 0),
+                rows_sel,
+                h_sel
+            )
+        )
+
+        top_feats = rep_sel.get("top_features", [])
+
+        if not top_feats:
+            st.warning("No se pudo calcular importance (AUC inválido o pocos datos).")
+        else:
+            imp_df = pd.DataFrame(top_feats, columns=["feature", "importance"])
+            fig_imp = px.bar(
+                imp_df,
+                x="importance",
+                y="feature",
+                orientation="h",
+                title=f"Top factores (perm. importance) — {h_sel}d"
+            )
+            fig_imp.update_layout(
+                height=420,
+                margin=dict(l=20, r=20, t=50, b=10),
+                paper_bgcolor="rgba(0,0,0,0)"
+            )
+            st.plotly_chart(fig_imp, use_container_width=True)
+
         st.caption(f"HMM status: {metrics.get('hmm_status','N/A')}")
 
 with tab3:
@@ -982,6 +1024,7 @@ with tab4:
             st.download_button("⬇️ Descargar daily_results.csv", f, file_name="daily_results.csv", mime="text/csv")
 
 st.caption("⚠️ Esto no garantiza subidas. Reduce incertidumbre con confluencia + gestión de riesgo.")
+
 
 
 
