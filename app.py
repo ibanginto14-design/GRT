@@ -104,18 +104,30 @@ section[data-testid="stSidebar"]{
   background: linear-gradient(180deg, rgba(15,23,48,0.95), rgba(16,27,59,0.85));
   border: 1px solid rgba(30,42,85,0.7);
 }
-.kpi .label{ color: var(--muted); font-size: 12px; margin-bottom: 6px; }
-.kpi .value{ font-size: 20px; font-weight: 800; }
-.kpi .hint{ color: var(--muted); font-size: 11px; margin-top: 6px; }
-.badge{
-  display:inline-block;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: rgba(168,85,247,0.15);
-  border:1px solid rgba(168,85,247,0.35);
-  color: var(--text);
+.kpi{
+  border-radius: 16px;
+  padding: 14px 14px;
+  background: linear-gradient(180deg, rgba(15,23,48,0.95), rgba(16,27,59,0.85));
+  border: 1px solid rgba(30,42,85,0.7);
+  color: var(--text) !important;                 /* <- FIX */
+}
+.kpi *{
+  color: var(--text) !important;                 /* <- FIX: fuerza todo dentro */
+}
+.kpi .label{
+  color: var(--muted) !important;                /* <- FIX */
   font-size: 12px;
-  margin-left: 8px;
+  margin-bottom: 6px;
+}
+.kpi .value{
+  color: var(--text) !important;                 /* <- FIX */
+  font-size: 20px;
+  font-weight: 800;
+}
+.kpi .hint{
+  color: var(--muted) !important;                /* <- FIX */
+  font-size: 11px;
+  margin-top: 6px;
 }
 </style>
 """
@@ -842,3 +854,4 @@ with tab4:
             st.download_button("⬇️ Descargar daily_results.csv", f, file_name="daily_results.csv", mime="text/csv")
 
 st.caption("⚠️ Esto no garantiza subidas. Reduce incertidumbre con confluencia + gestión de riesgo.")
+
