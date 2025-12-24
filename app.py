@@ -137,6 +137,36 @@ st.markdown(EPIC_CSS, unsafe_allow_html=True)
 # =========================
 # HELPERS
 # =========================
+def _fmt_pct(p: float) -> str:
+    if p is None or not np.isfinite(p):
+        return "—"
+    return f"{p*100:.1f}%"
+
+def explain_score(score: float) -> str:
+    if score is None or not np.isfinite(score):
+        return "Sin cálculo aún. Pulsa “Actualizar”."
+    if score >= 75:
+        return "Confluencia alta: señales alineadas (tendencia + momentum + riesgo)."
+    if score >= 60:
+        return "Confluencia moderada: hay señales a favor, pero con dudas."
+    if score >= 45:
+        return "Zona neutra: señales mezcladas, mejor esperar confirmación."
+    if score >= 30:
+        return "Confluencia baja: predominan señales débiles o de riesgo."
+    return "Riesgo elevado: señales mayoritariamente en contra."
+
+def explain_prob(p: float, horizon_days: int) -> str:
+    if p is None or not np.isfinite(p):
+        return f"Sin probabilidad calculada para {horizon_days}d (faltan datos o el modelo no entrenó)."
+    if p >= 0.70:
+        return f"Alta probabilidad según el modelo para {horizon_days} días. Aun así, no es garantía."
+    if p >= 0.60:
+        return f"Ventaja ligera a favor de subida a {horizon_days} días."
+    if p >= 0.50:
+        return f"Escenario muy equilibrado a {horizon_days} días (casi 50/50)."
+    if p >= 0.40:
+        return f"Ventaja ligera a favor de bajada o lateralidad a {horizon_days} días."
+    return f"Probabilidad baja de subida a {horizon_days} días (modelo ve más riesgo)."
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -744,24 +774,59 @@ if (not run_update) and (not hist.empty):
 # KPIs ARRIBA (lo que te salía vacío)
 # =========================
 c1, c2, c3, c4 = st.columns(4)
+
 with c1:
     st.markdown(
-        f"<div class='kpi'><div class='label'>GRT Score</div><div class='value'>{(score if score==score else np.nan):.1f}/100</div><div class='hint'>Confluencia</div></div>",
+        f"""
+        <div class='kpi'>
+          <div class='label'>GRT Score</div>
+          <div class='value'>{(score if score==score else np.nan):.1f}/100</div>
+          <div class='hint'>Confluencia</div>
+          <div class='hint'>{explain_score(score)}</div>
+        </div>
+        """,
         unsafe_allow_html=True
     )
+
 with c2:
+    p7 = probs.get(7, np.nan)
     st.markdown(
-        f"<div class='kpi'><div class='label'>P(↑ 7 días)</div><div class='value'>{(probs.get(7)*100 if probs.get(7)==probs.get(7) else np.nan):.1f}%</div><div class='hint'>Ensemble</div></div>",
+        f"""
+        <div class='kpi'>
+          <div class='label'>P(↑ 7 días)</div>
+          <div class='value'>{_fmt_pct(p7)}</div>
+          <div class='hint'>Ensemble</div>
+          <div class='hint'>{explain_prob(p7, 7)}</div>
+        </div>
+        """,
         unsafe_allow_html=True
     )
+
 with c3:
+    p30 = probs.get(30, np.nan)
     st.markdown(
-        f"<div class='kpi'><div class='label'>P(↑ 30 días)</div><div class='value'>{(probs.get(30)*100 if probs.get(30)==probs.get(30) else np.nan):.1f}%</div><div class='hint'>Ensemble</div></div>",
+        f"""
+        <div class='kpi'>
+          <div class='label'>P(↑ 30 días)</div>
+          <div class='value'>{_fmt_pct(p30)}</div>
+          <div class='hint'>Ensemble</div>
+          <div class='hint'>{explain_prob(p30, 30)}</div>
+        </div>
+        """,
         unsafe_allow_html=True
     )
+
 with c4:
+    p90 = probs.get(90, np.nan)
     st.markdown(
-        f"<div class='kpi'><div class='label'>P(↑ 90 días)</div><div class='value'>{(probs.get(90)*100 if probs.get(90)==probs.get(90) else np.nan):.1f}%</div><div class='hint'>Ensemble</div></div>",
+        f"""
+        <div class='kpi'>
+          <div class='label'>P(↑ 90 días)</div>
+          <div class='value'>{_fmt_pct(p90)}</div>
+          <div class='hint'>Ensemble</div>
+          <div class='hint'>{explain_prob(p90, 90)}</div>
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
@@ -854,4 +919,5 @@ with tab4:
             st.download_button("⬇️ Descargar daily_results.csv", f, file_name="daily_results.csv", mime="text/csv")
 
 st.caption("⚠️ Esto no garantiza subidas. Reduce incertidumbre con confluencia + gestión de riesgo.")
+
 
