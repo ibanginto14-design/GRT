@@ -950,7 +950,6 @@ for h in [7, 30, 90]:
         """,
         unsafe_allow_html=True
     )
-
         h_sel = st.selectbox("Ver factores top para horizonte", [7,30,90], index=1)
         top_feats = report.get(h_sel, {}).get("top_features", [])
         if not top_feats:
@@ -983,6 +982,7 @@ with tab4:
             st.download_button("⬇️ Descargar daily_results.csv", f, file_name="daily_results.csv", mime="text/csv")
 
 st.caption("⚠️ Esto no garantiza subidas. Reduce incertidumbre con confluencia + gestión de riesgo.")
+
 
 
 
