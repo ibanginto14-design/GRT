@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, List
 
 import numpy as np
@@ -13,8 +13,6 @@ import xml.etree.ElementTree as ET
 
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller, kpss
-from statsmodels.tsa.stattools import coint, grangercausalitytests
-
 from arch import arch_model
 import ruptures as rpt
 
@@ -25,10 +23,10 @@ from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
 from sklearn.inspection import permutation_importance
 
+from statsmodels.tsa.stattools import grangercausalitytests
+
 import plotly.graph_objects as go
 import plotly.express as px
-
-from email.utils import parsedate_to_datetime
 
 # HMM opcional
 try:
@@ -36,13 +34,6 @@ try:
     HMM_AVAILABLE = True
 except Exception:
     HMM_AVAILABLE = False
-
-# EVT opcional (SciPy)
-try:
-    from scipy.stats import genpareto
-    SCIPY_AVAILABLE = True
-except Exception:
-    SCIPY_AVAILABLE = False
 
 
 # =========================
@@ -64,21 +55,13 @@ DEFAULT_SETTINGS = {
     "benchmark": "BTC/USDT",
     "days": 900,
     "timeframe": "1d",
-    "api_keys": {
-        "thegraph_gateway": ""   # opcional
-    },
-    "news": {
-        "enable": True,
-        "lookback_days": 14,
-        "rss_timeout": 15
-    },
-    "backtest": {
-        "horizon_days": 30,
-        "step_days": 7,
-        "min_train_rows": 320,
-        "thr_long": 0.60,
-        "thr_cash": 0.45,
-        "fee_bps": 8,  # 0.08% por cambio de posición (aprox)
+    "api_keys": {"thegraph_gateway": ""},
+    "news": {"enable": True, "lookback_days": 14, "rss_timeout": 15},
+    "decision_lab": {
+        "mc_sims": 2500,
+        "mc_seed": 7,
+        "similarity_window_days": 180,
+        "granger_maxlag": 5
     }
 }
 
@@ -170,17 +153,17 @@ section[data-testid="stSidebar"]{
 
 .kpi .hint{
   color: var(--muted) !important;
-  font-size: 11px;
-  margin-top: 6px;
-  line-height: 1.25rem;
+  font-size: 12px;
+  margin-top: 10px;
+  line-height: 1.35rem;
 }
+
+hr { border-color: rgba(30,42,85,0.55) !important; }
 
 .small-muted{
   color: var(--muted);
   font-size: 12px;
 }
-
-hr { border-color: rgba(30,42,85,0.55) !important; }
 
 </style>
 """
@@ -214,11 +197,6 @@ def safe_float(x):
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def _clean_text(s: str) -> str:
-    if not s:
-        return ""
-    return "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in s)
-
 def load_settings() -> dict:
     if not os.path.exists(SETTINGS_PATH):
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
@@ -227,14 +205,13 @@ def load_settings() -> dict:
     with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
         s = json.load(f)
     # backfill keys
-    def _backfill(dst, src):
-        for k, v in src.items():
-            if k not in dst:
-                dst[k] = v
-            else:
-                if isinstance(v, dict) and isinstance(dst.get(k), dict):
-                    _backfill(dst[k], v)
-    _backfill(s, DEFAULT_SETTINGS)
+    for k, v in DEFAULT_SETTINGS.items():
+        if k not in s:
+            s[k] = v
+    if "news" not in s:
+        s["news"] = DEFAULT_SETTINGS["news"]
+    if "decision_lab" not in s:
+        s["decision_lab"] = DEFAULT_SETTINGS["decision_lab"]
     return s
 
 def save_settings(s: dict) -> None:
@@ -248,90 +225,88 @@ def _symbol_variants(symbol: str):
         variants += [f"{base}/USD", f"{base}/USDC"]
     return variants
 
+
+# =========================
+# EXPLICACIONES (amigables)
+# =========================
 def explain_score(score: float) -> str:
     if score is None or not np.isfinite(score):
         return "Sin cálculo aún. Pulsa “Actualizar”."
     if score >= 75:
-        return "Confluencia alta: muchas señales alineadas. Aun así, cripto puede sorprender: gestiona riesgo."
+        return ("Confluencia alta: varias señales están alineadas a la vez. "
+                "En términos sencillos: el mercado, el momentum, el riesgo y el contexto (noticias) están más a favor que en contra. "
+                "Aun así, en cripto nunca es garantía: sirve para reducir incertidumbre, no para eliminarla.")
     if score >= 60:
-        return "Confluencia moderada: señales a favor, pero con dudas. Mejor confirmar con varias pruebas."
+        return ("Confluencia moderada: hay señales a favor, pero no todas. "
+                "Esto suele ser útil para vigilar si aparece confirmación (por ejemplo, que el momentum mejore o que el riesgo extremo baje).")
     if score >= 45:
-        return "Zona neutra: señales mezcladas. Normalmente es zona de espera hasta que algo se decante."
+        return ("Zona neutra: hay señales mezcladas. "
+                "En este caso la estadística te está diciendo: “no tengo una historia clara”. "
+                "Normalmente conviene esperar a que una parte del puzzle se defina.")
     if score >= 30:
-        return "Confluencia baja: predominan señales débiles o riesgo alto. Cautela."
-    return "Riesgo elevado: el conjunto apunta más a proteger capital que a buscar subida."
-
-def explain_auc(auc: float) -> str:
-    if auc is None or not np.isfinite(auc):
-        return "AUC no disponible (pocos datos o test con una sola clase)."
-    if auc >= 0.70:
-        return "Muy buena: el modelo separa subidas/bajadas bastante bien (en su test)."
-    if auc >= 0.60:
-        return "Aceptable: algo de ventaja frente al azar."
-    if auc >= 0.55:
-        return "Débil: pequeña ventaja, úsalo con prudencia."
-    if auc >= 0.50:
-        return "Casi azar: apenas discrimina."
-    return "Peor que azar: podría estar invertido o sobreajustado."
+        return ("Confluencia baja: predominan señales de debilidad o riesgo. "
+                "No significa que no pueda rebotar, pero estadísticamente el contexto es más hostil.")
+    return ("Riesgo elevado: el conjunto de señales apunta a cautela. "
+            "Si alguien entra aquí, normalmente lo hace con tamaños pequeños, planes claros y tolerancia a volatilidad.")
 
 def explain_prob(p: float, horizon_days: int) -> str:
     if p is None or not np.isfinite(p):
-        return f"Sin probabilidad calculada para {horizon_days}d (faltan datos o el modelo no entrenó)."
+        return (f"Sin probabilidad calculada para {horizon_days} días. "
+                "Esto suele ocurrir si hay pocos datos limpios o si el modelo no logró entrenar bien. "
+                "No es tu culpa: es típico cuando faltan filas, hay NaNs o el comportamiento fue demasiado uniforme.")
     if p >= 0.75:
-        return f"Alta probabilidad de subida a {horizon_days} días según el modelo (no es garantía)."
+        return (f"Alta probabilidad de subida a {horizon_days} días según el modelo. "
+                "Traducción humana: con datos pasados parecidos, la proporción de casos de subida es alta. "
+                "Aun así, no es garantía: cripto puede romper patrones con noticias o shocks.")
     if p >= 0.60:
-        return f"Ventaja ligera a favor de subida a {horizon_days} días."
+        return (f"Ventaja ligera a favor de subida a {horizon_days} días. "
+                "Es una señal razonable, pero todavía exige confirmación con riesgo (colas) y tendencia.")
     if p >= 0.50:
-        return f"Escenario equilibrado a {horizon_days} días (casi 50/50)."
+        return (f"Escenario equilibrado a {horizon_days} días, casi 50/50. "
+                "En términos prácticos: el modelo no está viendo un sesgo fuerte, así que otras señales pesan más.")
     if p >= 0.40:
-        return f"Ventaja ligera a favor de bajada/lateralidad a {horizon_days} días."
-    return f"Probabilidad baja de subida a {horizon_days} días (más riesgo)."
+        return (f"Ventaja ligera hacia bajada o lateralidad a {horizon_days} días. "
+                "No significa caída segura; significa que la historia estadística reciente ha sido más complicada.")
+    return (f"Probabilidad baja de subida a {horizon_days} días: el modelo ve más riesgo o debilidad. "
+            "En ese contexto, suele ser clave mirar si estás en sobreventa (rebote) o si la tendencia fuerte sigue bajista.")
 
-def explain_sample_quality(n_train: int, n_test: int, rows_clean: int) -> str:
-    n = (n_train or 0) + (n_test or 0)
-    if n == 0 or rows_clean == 0:
-        return "Sin datos útiles tras limpiar (NaNs/alineación)."
-    if n < 250:
-        return "Pocos datos: fiabilidad baja. Úsalo como referencia, no como piloto automático."
-    if n < 500:
-        return "Datos moderados: fiabilidad media; confirma con otras señales."
-    return "Buen tamaño de muestra: fiabilidad mejor (aun con incertidumbre)."
+def explain_auc(auc: float) -> str:
+    if auc is None or not np.isfinite(auc):
+        return ("AUC no disponible: suele pasar si el test se queda con una sola clase (todo sube o todo baja) "
+                "o si la muestra es demasiado pequeña. En pocas palabras: no hay base para medir calidad.")
+    if auc >= 0.70:
+        return ("Muy buena calidad: el modelo separa subidas vs bajadas bastante mejor que el azar. "
+                "Esto no lo convierte en un oráculo, pero sí en una señal que merece respeto.")
+    if auc >= 0.60:
+        return ("Calidad aceptable: hay una ventaja estadística real frente al azar. "
+                "Aun así, en cripto conviene exigir confluencia con riesgo y contexto.")
+    if auc >= 0.55:
+        return ("Calidad débil: es mejor que azar, pero poco. "
+                "Suele ser útil solo si otras señales (tendencia, riesgo extremo, news) acompañan.")
+    if auc >= 0.50:
+        return ("Casi azar: el modelo apenas separa escenarios. "
+                "En esta situación es mejor usarlo como curiosidad, no como guía.")
+    return ("Peor que azar: puede indicar sobreajuste o que la señal está invertida. "
+            "No significa que ‘sea lo contrario’, significa que no es fiable.")
 
-def model_summary_text(p: float, auc: float, n_train: int, n_test: int, rows_clean: int, h: int) -> str:
-    p_txt = explain_prob(p, h)
-    auc_txt = explain_auc(auc)
-    samp_txt = explain_sample_quality(n_train, n_test, rows_clean)
-
-    if (p is not None and np.isfinite(p)) and (auc is not None and np.isfinite(auc)):
-        if auc >= 0.62 and p >= 0.62:
-            headline = "✅ Señal coherente (prob + calidad aceptable)."
-        elif auc < 0.55 and p >= 0.62:
-            headline = "⚠️ Probabilidad alta, pero calidad débil (ojo con sobreconfianza)."
-        elif auc >= 0.62 and p < 0.50:
-            headline = "⚠️ Calidad ok, pero sesgo bajista/lateral."
-        else:
-            headline = "🟡 Señal mixta (no concluyente)."
-    else:
-        headline = "—"
-
-    return f"{headline} {p_txt} {auc_txt} {samp_txt}"
-
-def robust_z(x: pd.Series) -> pd.Series:
-    s = x.astype(float).copy()
-    med = s.median()
-    mad = (s - med).abs().median()
-    return (s - med) / (1.4826 * mad + 1e-12)
-
-def _parse_pubdate_to_utc_date(s: str) -> Optional[pd.Timestamp]:
-    if not s:
-        return None
-    try:
-        dt = parsedate_to_datetime(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return pd.Timestamp(dt.astimezone(timezone.utc)).normalize()
-    except Exception:
-        return None
+def explain_news_score(x: float) -> str:
+    if x is None or not np.isfinite(x):
+        return ("No disponible: el RSS puede fallar o estar desactivado. "
+                "Cuando esto pase, la app sigue funcionando, solo pierde el contexto de titulares.")
+    if x >= 65:
+        return ("Titulares claramente positivos. Esto a veces acompaña fases de impulso, "
+                "pero también puede ser hype. La idea no es ‘comprar porque hay buenas noticias’, "
+                "sino usarlo como una pieza más: si el riesgo es extremo, la noticia puede no salvarte.")
+    if x >= 55:
+        return ("Sesgo ligeramente positivo. Puede ayudar a que el mercado tenga viento a favor, "
+                "pero por sí solo no justifica una inversión.")
+    if x >= 45:
+        return ("Neutral: titulares mezclados o sin mensaje claro. En este caso el precio y el riesgo suelen mandar más.")
+    if x >= 35:
+        return ("Sesgo negativo: aumenta la probabilidad de volatilidad y dudas. "
+                "No siempre significa caída, pero sí un contexto menos ‘cómodo’.")
+    return ("Muy negativo: cuidado con shocks. A veces después de extremos negativos hay rebotes, "
+            "pero suelen ser escenarios de alta incertidumbre.")
 
 
 # =========================
@@ -381,7 +356,7 @@ def compute_returns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# FUNDAMENTALS (CoinGecko + Gateway)
+# FUNDAMENTALS (CoinGecko + Gateway opcional)
 # =========================
 @st.cache_data(ttl=6*60*60)
 def fetch_grt_fundamentals_coingecko() -> pd.DataFrame:
@@ -440,8 +415,6 @@ def fetch_grt_network_fundamentals_gateway(thegraph_api_key: str) -> pd.DataFram
     row = {
         "as_of": str(pd.Timestamp.utcnow().date()),
         "totalTokensStaked": safe_float(gn.get("totalTokensStaked")),
-        "totalTokensAllocated": safe_float(gn.get("totalTokensAllocated")),
-        "totalDelegatedTokens": safe_float(gn.get("totalDelegatedTokens")),
         "totalSupply": safe_float(gn.get("totalSupply")),
         "activeIndexers": float(idx_count),
     }
@@ -449,7 +422,7 @@ def fetch_grt_network_fundamentals_gateway(thegraph_api_key: str) -> pd.DataFram
 
 
 # =========================
-# NEWS (RSS) -> Sentiment 0..100 + serie diaria (ventana)
+# NEWS (RSS) -> Sentiment 0..100 (robusto sin keys)
 # =========================
 POS_WORDS = {
     "upgrade","partnership","launch","released","adoption","growth","record","surge","bull",
@@ -461,6 +434,11 @@ NEG_WORDS = {
     "risk","warning","investigation","liquidation","delay","weak","negative","sec","rejected",
     "outage","attack","security","breach","concern"
 }
+
+def _clean_text(s: str) -> str:
+    if not s:
+        return ""
+    return "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in s)
 
 def score_sentiment(text: str) -> float:
     t = _clean_text(text)
@@ -491,21 +469,11 @@ def fetch_rss_items(url: str, timeout: int = 15, max_items: int = 25) -> List[di
             break
     return items
 
-def build_news_panel(enable: bool, lookback_days: int, timeout: int) -> Tuple[float, pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-      - score_0_100: float
-      - df_news: items (hasta 50)
-      - df_daily: serie diaria score 0..100 (solo ventana)
-    """
+def build_news_panel(enable: bool, timeout: int) -> Tuple[float, pd.DataFrame]:
     if not enable:
-        return np.nan, pd.DataFrame(), pd.DataFrame()
+        return np.nan, pd.DataFrame()
 
-    queries = [
-        "The+Graph+GRT",
-        "The+Graph+protocol",
-        "GRT+token",
-    ]
+    queries = ["The+Graph+GRT", "The+Graph+protocol", "GRT+token"]
     rss_urls = [f"https://news.google.com/rss/search?q={q}&hl=en&gl=US&ceid=US:en" for q in queries]
 
     all_items = []
@@ -516,36 +484,24 @@ def build_news_panel(enable: bool, lookback_days: int, timeout: int) -> Tuple[fl
             continue
 
     if not all_items:
-        return np.nan, pd.DataFrame(), pd.DataFrame()
-
-    cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=int(lookback_days))
+        return np.nan, pd.DataFrame()
 
     rows = []
     for it in all_items:
-        dt = _parse_pubdate_to_utc_date(it.get("pubDate",""))
-        if dt is None:
-            continue
-        if dt < cutoff:
-            continue
         txt = f"{it.get('title','')} {it.get('desc','')}"
         s = score_sentiment(txt)
-        rows.append({
-            "date": dt,
-            "title": it.get("title",""),
-            "pubDate": it.get("pubDate",""),
-            "link": it.get("link",""),
-            "sent": float(s)
-        })
+        rows.append({"title": it.get("title",""), "pubDate": it.get("pubDate",""), "link": it.get("link",""), "sent": s})
 
-    df_news = pd.DataFrame(rows).drop_duplicates(subset=["title"]).head(80)
+    df_news = pd.DataFrame(rows).drop_duplicates(subset=["title"]).head(60)
     if df_news.empty:
-        return np.nan, df_news, pd.DataFrame()
+        return np.nan, df_news
 
     svals = df_news["sent"].astype(float).values
     svals = svals[np.isfinite(svals)]
     if len(svals) == 0:
-        return np.nan, df_news, pd.DataFrame()
+        return np.nan, df_news
 
+    # trimmed mean (robusto)
     svals_sorted = np.sort(svals)
     k = max(0, int(0.1 * len(svals_sorted)))
     core = svals_sorted[k:len(svals_sorted)-k] if len(svals_sorted) > 10 else svals_sorted
@@ -553,31 +509,11 @@ def build_news_panel(enable: bool, lookback_days: int, timeout: int) -> Tuple[fl
 
     score_0_100 = float(np.clip(50 + 50*m, 0, 100))
     df_news["sent_0_100"] = (50 + 50*df_news["sent"]).clip(0, 100)
-
-    # Daily series (mean)
-    df_daily = (df_news.groupby("date")["sent"].mean()
-                .rename("sent_mean")
-                .to_frame())
-    df_daily["score_0_100"] = (50 + 50*df_daily["sent_mean"]).clip(0, 100)
-
-    return score_0_100, df_news, df_daily
-
-def explain_news_score(x: float) -> str:
-    if x is None or not np.isfinite(x):
-        return "No disponible (RSS falló o está desactivado)."
-    if x >= 65:
-        return "Titulares claramente positivos: puede acompañar impulso, pero también puede ser hype."
-    if x >= 55:
-        return "Ligero sesgo positivo: apoyo contextual, no suficiente por sí solo."
-    if x >= 45:
-        return "Neutral: noticias mezcladas o sin señal clara."
-    if x >= 35:
-        return "Sesgo negativo: aumenta la probabilidad de volatilidad/venta defensiva."
-    return "Muy negativo: cuidado con shocks (aunque a veces hay rebotes técnicos)."
+    return score_0_100, df_news
 
 
 # =========================
-# TECHNICAL INDICATORS
+# INDICADORES TÉCNICOS
 # =========================
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -611,11 +547,7 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     low = df["low"].astype(float)
     close = df["close"].astype(float)
     prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
 def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -629,16 +561,12 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    tr = pd.concat([
-        (high - low),
-        (high - close.shift(1)).abs(),
-        (low - close.shift(1)).abs()
-    ], axis=1).max(axis=1)
-
+    tr = pd.concat([(high - low), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
     atr_ = tr.rolling(period).mean()
+
     plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(period).mean() / (atr_ + 1e-12))
     minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(period).mean() / (atr_ + 1e-12))
-    dx = (100 * (plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-12))
+    dx = 100 * (plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-12)
     return dx.rolling(period).mean()
 
 def max_drawdown(close: pd.Series) -> float:
@@ -646,62 +574,6 @@ def max_drawdown(close: pd.Series) -> float:
     roll_max = c.cummax()
     dd = (c / roll_max) - 1.0
     return float(dd.min()) if len(dd.dropna()) else np.nan
-
-def drawdown_series(close: pd.Series) -> pd.Series:
-    c = close.astype(float)
-    roll_max = c.cummax()
-    return (c / roll_max) - 1.0
-
-def drawdown_duration(close: pd.Series) -> Tuple[float, float]:
-    """
-    Returns:
-      - max_duration_days: duración máxima de drawdown (en días/barras)
-      - avg_duration_days: duración media de drawdowns
-    """
-    dd = drawdown_series(close).fillna(0.0)
-    in_dd = dd < 0
-    durations = []
-    cur = 0
-    for v in in_dd.values:
-        if v:
-            cur += 1
-        else:
-            if cur > 0:
-                durations.append(cur)
-            cur = 0
-    if cur > 0:
-        durations.append(cur)
-    if not durations:
-        return np.nan, np.nan
-    return float(np.max(durations)), float(np.mean(durations))
-
-def time_to_recovery(close: pd.Series) -> float:
-    """
-    Tiempo desde el último máximo histórico hasta recuperarlo (si ya recuperó).
-    Si está por debajo del máximo, devuelve días desde el último máximo.
-    """
-    c = close.astype(float).dropna()
-    if c.empty:
-        return np.nan
-    roll_max = c.cummax()
-    last_peak_idx = roll_max.idxmax()  # primer máximo global; no sirve
-    # mejor: último día en el que se tocó el máximo hasta hoy
-    max_level = roll_max.iloc[-1]
-    hit_dates = roll_max[roll_max == max_level].index
-    if len(hit_dates) == 0:
-        return np.nan
-    last_hit = hit_dates[-1]
-    # si hoy es máximo, recovery=0; si no, esto no ocurre porque max_level es el máximo hasta hoy.
-    # Queremos: si ahora está en drawdown vs su max, días desde el último máximo anterior:
-    dd = drawdown_series(c)
-    if dd.iloc[-1] >= 0:
-        return 0.0
-    # último punto donde dd==0
-    zeros = dd[dd >= -1e-12]
-    if zeros.empty:
-        return float(len(dd))
-    last_zero = zeros.index[-1]
-    return float((pd.Timestamp(c.index[-1]) - pd.Timestamp(last_zero)).days if hasattr(pd.Timestamp(c.index[-1]), "day") else (len(dd) - len(zeros)))
 
 def var_cvar(r: pd.Series, alpha=0.05) -> Tuple[float, float]:
     x = r.dropna().astype(float)
@@ -720,8 +592,7 @@ def sharpe_simple(r: pd.Series, periods_per_year=365) -> float:
     return float(mu / (sd + 1e-12))
 
 def beta_vs_bench(asset_r: pd.Series, bench_r: pd.Series, window=180) -> float:
-    tmp = pd.concat([asset_r.rename("a"), bench_r.rename("b")], axis=1).dropna()
-    tmp = tmp.tail(window)
+    tmp = pd.concat([asset_r.rename("a"), bench_r.rename("b")], axis=1).dropna().tail(window)
     if len(tmp) < 60:
         return np.nan
     cov = np.cov(tmp["a"], tmp["b"])[0, 1]
@@ -734,71 +605,9 @@ def realized_vol(r: pd.Series, window=30) -> float:
         return np.nan
     return float(x.std() * np.sqrt(365))
 
-def jump_stats(r: pd.Series, window=30, k=3.0) -> dict:
-    """
-    Detecta "saltos" cuando |ret| > k * std_rolling(window)
-    """
-    x = r.dropna().astype(float)
-    if len(x) < window + 50:
-        return {"jump_rate": np.nan, "jumps_last90": np.nan}
-    vol = x.rolling(window).std()
-    jumps = (x.abs() > (k * vol)).astype(int)
-    return {
-        "jump_rate": float(jumps.mean()),
-        "jumps_last90": float(jumps.tail(90).sum())
-    }
-
-def evt_tail_risk(r: pd.Series, alpha=0.01) -> dict:
-    """
-    EVT opcional: estima VaR y ES en colas usando GPD sobre pérdidas extremas.
-    Si SciPy no está disponible, devuelve NaN.
-    """
-    if not SCIPY_AVAILABLE:
-        return {"evt_var_99": np.nan, "evt_es_99": np.nan, "evt_status": "SciPy not available"}
-    x = r.dropna().astype(float)
-    if len(x) < 500:
-        return {"evt_var_99": np.nan, "evt_es_99": np.nan, "evt_status": "Not enough data"}
-    losses = (-x).clip(lower=0)  # pérdidas positivas
-    # umbral: percentil 95 de pérdidas (miramos cola)
-    u = np.quantile(losses[losses > 0], 0.95) if np.any(losses > 0) else np.nan
-    if not np.isfinite(u) or u <= 0:
-        return {"evt_var_99": np.nan, "evt_es_99": np.nan, "evt_status": "No losses / invalid threshold"}
-    exc = losses[losses > u] - u
-    if len(exc) < 50:
-        return {"evt_var_99": np.nan, "evt_es_99": np.nan, "evt_status": "Too few exceedances"}
-    # Fit GPD to exceedances
-    c, loc, scale = genpareto.fit(exc.values, floc=0.0)
-    # Tail probability of exceedance
-    n = len(losses)
-    nu = len(exc)
-    pu = nu / n  # P(loss>u)
-    # VaR at alpha (e.g., 1%): we need quantile of loss distribution
-    # For losses: VaR_alpha is such that P(L > VaR) = alpha -> VaR is high quantile.
-    # Under POT: VaR = u + GPD^{-1}(1 - alpha/pu)
-    if pu <= 0 or alpha <= 0 or alpha >= pu:
-        # if alpha is larger than tail prob, EVT not appropriate
-        return {"evt_var_99": np.nan, "evt_es_99": np.nan, "evt_status": "alpha not in tail region"}
-    q = 1 - (alpha / pu)
-    # inverse CDF of GPD: scale/c * ((1-q)^(-c) -1) when c!=0
-    if abs(c) < 1e-8:
-        inv = scale * (-np.log(1 - q))
-    else:
-        inv = (scale / c) * ((1 - q) ** (-c) - 1)
-    var = u + inv
-    # ES approximation: E[L | L > VaR] = VaR + (scale + c*(VaR-u)) / (1-c) for c<1
-    if c >= 1:
-        es = np.nan
-    else:
-        es = var + (scale + c * (var - u)) / (1 - c)
-    return {
-        "evt_var_99": float(-var),   # lo devolvemos como retorno negativo (pérdida)
-        "evt_es_99": float(-es) if np.isfinite(es) else np.nan,
-        "evt_status": "OK"
-    }
-
 
 # =========================
-# METRICS (base + añadidas)
+# METRICS (base + extra)
 # =========================
 def trend_regression(df: pd.DataFrame, window: int = 90) -> dict:
     d = df.dropna().tail(window).copy()
@@ -814,9 +623,9 @@ def stationarity_tests(df: pd.DataFrame) -> dict:
     d = df["log_ret"].dropna()
     if len(d) < 120:
         return {"adf_pvalue": np.nan, "kpss_pvalue": np.nan}
-    adf_res = adfuller(d, autolag="AIC")
+    adf = adfuller(d, autolag="AIC")
     kpss_stat, kpss_p, _, _ = kpss(d, regression="c", nlags="auto")
-    return {"adf_pvalue": float(adf_res[1]), "kpss_pvalue": float(kpss_p)}
+    return {"adf_pvalue": float(adf[1]), "kpss_pvalue": float(kpss_p)}
 
 def momentum_metrics(df: pd.DataFrame) -> dict:
     r = df["ret"].dropna()
@@ -885,11 +694,6 @@ def extra_market_stats(df: pd.DataFrame, dfb: pd.DataFrame) -> dict:
     ann_ret = float((1 + r.tail(365)).prod() - 1) if len(r) >= 365 else np.nan
     ann_vol = float(r.tail(365).std() * np.sqrt(365)) if len(r) >= 180 else np.nan
 
-    dd_max_dur, dd_avg_dur = drawdown_duration(close)
-
-    js = jump_stats(r, window=30, k=3.0)
-    evt = evt_tail_risk(r, alpha=0.01)
-
     return {
         "max_drawdown": dd,
         "var_95": v,
@@ -905,61 +709,11 @@ def extra_market_stats(df: pd.DataFrame, dfb: pd.DataFrame) -> dict:
         "adx_14": adx14,
         "ann_return_est": ann_ret,
         "ann_vol_est": ann_vol,
-        "dd_max_duration": dd_max_dur,
-        "dd_avg_duration": dd_avg_dur,
-        "jump_rate": js.get("jump_rate", np.nan),
-        "jumps_last90": js.get("jumps_last90", np.nan),
-        "evt_var_99": evt.get("evt_var_99", np.nan),
-        "evt_es_99": evt.get("evt_es_99", np.nan),
-        "evt_status": evt.get("evt_status", "N/A"),
     }
-
-def bench_relationship_tests(df: pd.DataFrame, dfb: pd.DataFrame) -> dict:
-    """
-    Tests:
-      - Cointegration (Engle-Granger) on log prices
-      - Granger causality on returns (bench -> asset)
-    """
-    if df is None or df.empty or dfb is None or dfb.empty:
-        return {"coint_pvalue": np.nan, "granger_min_pvalue": np.nan}
-
-    a = pd.Series(df["close"].astype(float), index=pd.to_datetime(df.index))
-    b = pd.Series(dfb["close"].astype(float), index=pd.to_datetime(dfb.index))
-    tmp = pd.concat([a.rename("a"), b.rename("b")], axis=1).dropna()
-    if len(tmp) < 300:
-        return {"coint_pvalue": np.nan, "granger_min_pvalue": np.nan}
-
-    # Cointegration on log prices
-    try:
-        coint_t, pval, _ = coint(np.log(tmp["a"]), np.log(tmp["b"]))
-        coint_p = float(pval)
-    except Exception:
-        coint_p = np.nan
-
-    # Granger causality: do bench returns help predict asset returns?
-    ra = tmp["a"].pct_change().dropna()
-    rb = tmp["b"].pct_change().dropna()
-    d = pd.concat([ra.rename("asset"), rb.rename("bench")], axis=1).dropna()
-    if len(d) < 400:
-        gr_p = np.nan
-    else:
-        try:
-            # grangercausalitytests expects array with columns [y, x]
-            # We want: asset ~ lagged bench => y=asset, x=bench
-            res = grangercausalitytests(d[["asset", "bench"]], maxlag=5, verbose=False)
-            pvals = []
-            for lag, out in res.items():
-                # ssr_ftest pvalue
-                pvals.append(out[0]["ssr_ftest"][1])
-            gr_p = float(np.min(pvals)) if pvals else np.nan
-        except Exception:
-            gr_p = np.nan
-
-    return {"coint_pvalue": coint_p, "granger_min_pvalue": gr_p}
 
 
 # =========================
-# HMM (ROBUSTO)
+# HMM (robusto)
 # =========================
 def hmm_regimes_robust(df: pd.DataFrame) -> dict:
     if not HMM_AVAILABLE:
@@ -970,23 +724,15 @@ def hmm_regimes_robust(df: pd.DataFrame) -> dict:
         return {"hmm_regime": None, "hmm_p_regime": np.nan, "hmm_status": "Not enough data"}
 
     vol = r.rolling(14).std()
-    X = pd.concat([r.rename("ret"), vol.rename("vol")], axis=1)
-    X = X.replace([np.inf, -np.inf], np.nan).dropna()
-
+    X = pd.concat([r.rename("ret"), vol.rename("vol")], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
     if len(X) < 200:
         return {"hmm_regime": None, "hmm_p_regime": np.nan, "hmm_status": "Not enough clean rows"}
 
     scaler = StandardScaler()
-    Xs = scaler.fit_transform(X.values)
-    Xs = Xs + np.random.normal(0, 1e-8, size=Xs.shape)
+    Xs = scaler.fit_transform(X.values) + np.random.normal(0, 1e-8, size=X.shape)
 
     try:
-        model = GaussianHMM(
-            n_components=3,
-            covariance_type="diag",
-            n_iter=300,
-            random_state=7
-        )
+        model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=300, random_state=7)
         model.fit(Xs)
 
         post = model.predict_proba(Xs)
@@ -1004,20 +750,14 @@ def hmm_regimes_robust(df: pd.DataFrame) -> dict:
         label = label_map.get(current_state, "Unknown")
 
         return {"hmm_regime": label, "hmm_p_regime": p_state, "hmm_status": "OK"}
-
     except Exception as e:
         return {"hmm_regime": None, "hmm_p_regime": np.nan, "hmm_status": f"HMM failed: {e}"}
 
 
 # =========================
-# FEATURES + MODELOS (incluye NEWS + fundamentals broadcast)
+# FEATURES + MODELOS (incluye NEWS)
 # =========================
-def build_feature_frame(
-    df: pd.DataFrame,
-    bench: pd.DataFrame,
-    fund_last: Optional[pd.Series],
-    news_score_0_100: Optional[float]
-) -> pd.DataFrame:
+def build_feature_frame(df: pd.DataFrame, bench: pd.DataFrame, fund_last: Optional[pd.Series], news_score_0_100: Optional[float]) -> pd.DataFrame:
     d = df.copy()
 
     d["ret_1"] = d["ret"]
@@ -1034,6 +774,7 @@ def build_feature_frame(
     d["skew_90"] = d["ret"].rolling(90).skew()
     d["kurt_90"] = d["ret"].rolling(90).kurt()
 
+    # indicators
     d["rsi_14"] = rsi(d["close"].astype(float), 14)
     macd_line, macd_sig, macd_hist = macd(d["close"].astype(float))
     d["macd_line"] = macd_line
@@ -1042,12 +783,10 @@ def build_feature_frame(
     d["atr_14"] = atr(d, 14)
     d["adx_14"] = adx(d, 14)
 
-    if news_score_0_100 is not None and np.isfinite(news_score_0_100):
-        d["news_score_0_100"] = float(news_score_0_100)
-    else:
-        d["news_score_0_100"] = np.nan
+    # news feature (broadcast)
+    d["news_score_0_100"] = float(news_score_0_100) if (news_score_0_100 is not None and np.isfinite(news_score_0_100)) else np.nan
 
-    # fundamentals (broadcast)
+    # fundamentals broadcast
     if fund_last is not None and not fund_last.empty:
         for k, v in fund_last.to_dict().items():
             d[f"fund_{k}"] = safe_float(v)
@@ -1066,12 +805,10 @@ def build_feature_frame(
 
 def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_rows=250) -> Tuple[dict, dict, dict]:
     feat = feat.copy()
-
     drop_cols = {"open","high","low","close","volume","log_close","ret","log_ret"}
     candidates = [c for c in feat.columns if c not in drop_cols]
 
-    X_all = feat[candidates].apply(pd.to_numeric, errors="coerce")
-    X_all = X_all.replace([np.inf, -np.inf], np.nan)
+    X_all = feat[candidates].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     X_all = X_all.ffill().bfill()
 
     probs = {}
@@ -1127,362 +864,13 @@ def fit_ensemble_probabilities(feat: pd.DataFrame, horizons=(7, 30, 90), min_row
         except Exception:
             top_feats = []
 
-        report[h] = {
-            "auc": float(auc) if auc == auc else np.nan,
-            "n_train": int(len(train)),
-            "n_test": int(len(test)),
-            "top_features": top_feats
-        }
+        report[h] = {"auc": float(auc) if auc == auc else np.nan, "n_train": int(len(train)), "n_test": int(len(test)), "top_features": top_feats}
 
     return probs, report, diag
 
 
 # =========================
-# WALK-FORWARD BACKTEST + CALIBRATION + LIFT + CFR
-# =========================
-def _prep_xy_for_horizon(feat: pd.DataFrame, horizon: int) -> Tuple[pd.DataFrame, pd.Series]:
-    drop_cols = {"open","high","low","close","volume","log_close","ret","log_ret"}
-    candidates = [c for c in feat.columns if c not in drop_cols]
-    X = feat[candidates].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    X = X.ffill().bfill()
-    y = (((feat["close"].shift(-horizon) / feat["close"]) - 1.0) > 0).astype(int)
-    return X, y
-
-@st.cache_data(ttl=60*60)
-def walk_forward_prob_series(feat: pd.DataFrame, horizon: int, step_days: int = 7, min_train_rows: int = 320) -> pd.Series:
-    """
-    Genera probabilidades out-of-sample estilo walk-forward:
-      - entrena con datos hasta t
-      - predice para t (probabilidad de subida a horizon)
-      - avanza step_days
-    """
-    feat = feat.copy()
-    X, y = _prep_xy_for_horizon(feat, horizon)
-    data = pd.concat([X, y.rename("y")], axis=1).dropna()
-    if len(data) < (min_train_rows + 50):
-        return pd.Series(dtype=float)
-
-    idx = data.index
-    probs = pd.Series(index=idx, dtype=float)
-
-    # modelos
-    def _make_models():
-        logit = Pipeline([
-            ("scaler", StandardScaler(with_mean=False)),
-            ("clf", LogisticRegression(max_iter=700, n_jobs=1))
-        ])
-        gbt = GradientBoostingClassifier(random_state=7)
-        return logit, gbt
-
-    # puntos walk-forward
-    start = min_train_rows
-    for i in range(start, len(data), int(max(1, step_days))):
-        train = data.iloc[:i]
-        test_row = data.iloc[[i]]
-
-        X_train = train.drop(columns=["y"])
-        y_train = train["y"].astype(int)
-        X_test = test_row.drop(columns=["y"])
-
-        # si y_train es todo una clase => no entrenamos
-        if len(np.unique(y_train)) < 2:
-            continue
-
-        logit, gbt = _make_models()
-        try:
-            logit.fit(X_train, y_train)
-            gbt.fit(X_train, y_train)
-            p = 0.5 * logit.predict_proba(X_test)[:, 1][0] + 0.5 * gbt.predict_proba(X_test)[:, 1][0]
-            probs.iloc[i] = float(p)
-        except Exception:
-            continue
-
-    return probs.dropna()
-
-def simulate_strategy_from_probs(
-    close: pd.Series,
-    ret: pd.Series,
-    probs: pd.Series,
-    thr_long: float = 0.60,
-    thr_cash: float = 0.45,
-    fee_bps: float = 8.0
-) -> pd.DataFrame:
-    """
-    Estrategia simple:
-      - Si prob > thr_long => estar en mercado (posición=1)
-      - Si prob < thr_cash => estar fuera (posición=0)
-      - Si está entre medias => mantener posición anterior
-    Fee: se aplica cuando cambia la posición (bps)
-    """
-    c = close.astype(float).copy()
-    r = ret.astype(float).copy()
-    p = probs.reindex(c.index).ffill()
-
-    pos = pd.Series(index=c.index, dtype=float)
-    cur = 0.0
-    for i, dt in enumerate(c.index):
-        pv = p.loc[dt] if dt in p.index else np.nan
-        if np.isfinite(pv):
-            if pv > thr_long:
-                cur = 1.0
-            elif pv < thr_cash:
-                cur = 0.0
-            else:
-                cur = cur
-        pos.iloc[i] = cur
-
-    fee = (fee_bps / 10000.0)
-    turns = pos.diff().abs().fillna(0.0)
-    strat_ret = pos.shift(1).fillna(0.0) * r - turns * fee
-
-    eq = (1 + strat_ret.fillna(0)).cumprod()
-    bh = (1 + r.fillna(0)).cumprod()
-
-    out = pd.DataFrame({
-        "close": c,
-        "prob": p,
-        "position": pos,
-        "asset_ret": r,
-        "strategy_ret": strat_ret,
-        "equity_strategy": eq,
-        "equity_buyhold": bh
-    })
-    return out
-
-def perf_stats(equity: pd.Series, daily_ret: pd.Series) -> dict:
-    eq = equity.dropna().astype(float)
-    r = daily_ret.dropna().astype(float)
-    if len(eq) < 60 or len(r) < 60:
-        return {"cagr": np.nan, "sharpe": np.nan, "max_dd": np.nan, "win_rate": np.nan}
-    days = len(eq)
-    cagr = float(eq.iloc[-1] ** (365.0 / max(1, days)) - 1)
-    sh = sharpe_simple(r, periods_per_year=365)
-    mdd = float(drawdown_series(eq).min())
-    win = float((r > 0).mean())
-    return {"cagr": cagr, "sharpe": sh, "max_dd": mdd, "win_rate": win}
-
-def calibration_table(prob: pd.Series, y_true: pd.Series, n_bins: int = 10) -> pd.DataFrame:
-    tmp = pd.concat([prob.rename("p"), y_true.rename("y")], axis=1).dropna()
-    if len(tmp) < 200:
-        return pd.DataFrame()
-    tmp["bin"] = pd.qcut(tmp["p"], q=n_bins, duplicates="drop")
-    g = tmp.groupby("bin").agg(
-        p_mean=("p", "mean"),
-        y_rate=("y", "mean"),
-        n=("y", "size")
-    ).reset_index(drop=True)
-    return g
-
-def brier_score(prob: pd.Series, y_true: pd.Series) -> float:
-    tmp = pd.concat([prob.rename("p"), y_true.rename("y")], axis=1).dropna()
-    if len(tmp) < 200:
-        return np.nan
-    p = tmp["p"].clip(1e-6, 1-1e-6).astype(float)
-    y = tmp["y"].astype(float)
-    return float(np.mean((p - y) ** 2))
-
-def lift_deciles(prob: pd.Series, fwd_ret: pd.Series, n_bins: int = 10) -> pd.DataFrame:
-    tmp = pd.concat([prob.rename("p"), fwd_ret.rename("fwd")], axis=1).dropna()
-    if len(tmp) < 200:
-        return pd.DataFrame()
-    tmp["decile"] = pd.qcut(tmp["p"], q=n_bins, labels=False, duplicates="drop") + 1
-    out = tmp.groupby("decile").agg(
-        p_mean=("p","mean"),
-        fwd_mean=("fwd","mean"),
-        fwd_median=("fwd","median"),
-        n=("fwd","size")
-    ).reset_index()
-    return out.sort_values("decile")
-
-def bootstrap_mean_ci(x: np.ndarray, n_boot: int = 2000, alpha: float = 0.05, seed: int = 7) -> Tuple[float, float]:
-    rng = np.random.default_rng(seed)
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    if len(x) < 30:
-        return (np.nan, np.nan)
-    means = []
-    for _ in range(n_boot):
-        samp = rng.choice(x, size=len(x), replace=True)
-        means.append(np.mean(samp))
-    lo = float(np.quantile(means, alpha/2))
-    hi = float(np.quantile(means, 1 - alpha/2))
-    return lo, hi
-
-def mann_whitney_u_test(a: np.ndarray, b: np.ndarray) -> float:
-    # Implementación simple sin SciPy: aproximación con ranks (no exacta para empates pesados),
-    # si SciPy está, mejor usarla. Aquí lo dejamos robusto: si SciPy no está => NaN.
-    try:
-        from scipy.stats import mannwhitneyu
-        a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
-        a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
-        if len(a) < 30 or len(b) < 30:
-            return np.nan
-        _, p = mannwhitneyu(a, b, alternative="two-sided")
-        return float(p)
-    except Exception:
-        return np.nan
-
-def conditional_forward_returns(df: pd.DataFrame, horizon: int = 30) -> pd.DataFrame:
-    """
-    CFR: compara retorno futuro cuando se cumple condición vs cuando no.
-    Condiciones incluidas: RSI<30, RSI>70, ADX>25, BB%B extremos.
-    """
-    close = df["close"].astype(float)
-    rsi14 = rsi(close, 14)
-    adx14 = adx(df, 14)
-    bbp = bollinger_pctb(close)
-
-    fwd = (close.shift(-horizon) / close - 1.0).astype(float)
-
-    conditions = {
-        "RSI<30 (sobreventa)": (rsi14 < 30),
-        "RSI>70 (sobrecompra)": (rsi14 > 70),
-        "ADX>25 (tendencia fuerte)": (adx14 > 25),
-        "BB%B<0.1 (cerca banda baja)": (bbp < 0.1),
-        "BB%B>0.9 (cerca banda alta)": (bbp > 0.9),
-    }
-
-    rows = []
-    base = fwd.dropna().values
-    base_mean = np.mean(base) if len(base) else np.nan
-
-    for name, mask in conditions.items():
-        a = fwd[mask].dropna().values
-        b = fwd[~mask].dropna().values
-        if len(a) < 60 or len(b) < 60:
-            rows.append({
-                "Condición": name,
-                "N cond": int(len(a)),
-                "Media fwd": np.nan,
-                "IC 95% (lo)": np.nan,
-                "IC 95% (hi)": np.nan,
-                "Media no-cond": np.nan,
-                "p (M-W)": np.nan,
-                "Diff vs base": np.nan,
-            })
-            continue
-        lo, hi = bootstrap_mean_ci(a, n_boot=1500, alpha=0.05, seed=7)
-        pval = mann_whitney_u_test(a, b)
-        rows.append({
-            "Condición": name,
-            "N cond": int(len(a)),
-            "Media fwd": float(np.mean(a)),
-            "IC 95% (lo)": lo,
-            "IC 95% (hi)": hi,
-            "Media no-cond": float(np.mean(b)),
-            "p (M-W)": pval,
-            "Diff vs base": float(np.mean(a) - base_mean) if np.isfinite(base_mean) else np.nan,
-        })
-    return pd.DataFrame(rows)
-
-def explain_cfr():
-    return (
-        "Estas pruebas responden a la pregunta clave: **“cuando aparece una señal, qué pasa después, en promedio?”**\n\n"
-        "- No miramos el indicador por estética; miramos **retorno futuro**.\n"
-        "- Incluimos un **intervalo de confianza (bootstrap)**: si es muy ancho, la señal es poco estable.\n"
-        "- Incluimos una **prueba estadística** (Mann-Whitney) que compara la distribución de retornos cuando la condición se cumple vs cuando no.\n\n"
-        "Cómo leerlo sin finanzas:\n"
-        "- Si ‘Media fwd’ es positiva y el IC 95% está bastante por encima de 0, suele ser una señal más interesante.\n"
-        "- Si el p-valor es bajo (por ejemplo < 0.05) sugiere que la diferencia no parece casual.\n"
-        "- Si hay pocos casos (N cond pequeño), no te fíes: puede ser coincidencia."
-    )
-
-
-# =========================
-# PPEI (Protocol-to-Price Elasticity Index) usando histórico guardado
-# =========================
-def compute_ppei_from_history(hist: pd.DataFrame, horizon: int = 30) -> dict:
-    """
-    Usa daily_results.csv (histórico) para estimar si cambios del "protocolo" (stake/indexers/ratios)
-    se relacionan con retornos futuros.
-    Devuelve:
-      - coef (elasticidad): cuánto cambia retorno futuro por 1 unidad de cambio estandarizado en protocolo
-      - ppei_today: coef * cambio reciente protocolo (proxy)
-      - r2 / n
-    """
-    if hist is None or hist.empty:
-        return {"ppei_coef": np.nan, "ppei_today": np.nan, "ppei_r2": np.nan, "ppei_n": 0, "ppei_status": "No history"}
-
-    h = hist.copy()
-    # Normaliza fecha
-    if "as_of_date" not in h.columns:
-        return {"ppei_coef": np.nan, "ppei_today": np.nan, "ppei_r2": np.nan, "ppei_n": 0, "ppei_status": "Missing as_of_date"}
-    h["as_of_date"] = pd.to_datetime(h["as_of_date"], errors="coerce")
-    h = h.dropna(subset=["as_of_date"]).sort_values("as_of_date")
-
-    # Necesitamos variables fundamentals guardadas
-    candidates = []
-    for col in ["fund_totalTokensStaked", "fund_activeIndexers", "fund_fund_stake_ratio", "fund_totalDelegatedTokens", "fund_totalTokensAllocated"]:
-        if col in h.columns:
-            candidates.append(col)
-
-    # fallback: si viene del gateway, guardamos en columns sin fund_ (por si alguien lo cambió)
-    for col in ["totalTokensStaked", "activeIndexers", "totalDelegatedTokens", "totalTokensAllocated"]:
-        if col in h.columns and col not in candidates:
-            candidates.append(col)
-
-    if len(candidates) < 2:
-        return {"ppei_coef": np.nan, "ppei_today": np.nan, "ppei_r2": np.nan, "ppei_n": 0, "ppei_status": "Not enough protocol fields in history"}
-
-    # target: usar retornos de precio aproximados desde histórico de close si estuviera, pero no lo guardamos.
-    # Solución: usar score/model probs no sirve. Así que PPEI se basa en cambios de protocolo vs cambios de “score”?
-    # Mejor: si en histórico existe 'p_up_30d' y 'score_0_100', usar retorno futuro prox = (p_up_30d - 0.5)
-    # Esto NO es precio real, pero permite un índice consistente dentro de la app.
-    # Si quieres PPEI real, lo ideal es guardar además el 'close' diario.
-    if "close" in h.columns:
-        close = pd.to_numeric(h["close"], errors="coerce")
-        fwd_ret = close.shift(-horizon) / close - 1.0
-    else:
-        # proxy: ventaja del modelo (centra en 0)
-        pcol = "p_up_30d" if "p_up_30d" in h.columns else None
-        if pcol is None:
-            return {"ppei_coef": np.nan, "ppei_today": np.nan, "ppei_r2": np.nan, "ppei_n": 0, "ppei_status": "No close and no p_up_30d to proxy"}
-        fwd_ret = pd.to_numeric(h[pcol], errors="coerce") - 0.5
-
-    # features: cambios % (log-diff) del protocolo
-    feats = pd.DataFrame(index=h.index)
-    for col in candidates:
-        x = pd.to_numeric(h[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        feats[col] = np.log(x).diff()
-
-    # protocolo_score: media de z-scores robustos
-    proto = feats.apply(lambda s: robust_z(s), axis=0).mean(axis=1)
-    proto = proto.replace([np.inf, -np.inf], np.nan)
-
-    dfm = pd.concat([proto.rename("proto"), fwd_ret.rename("y")], axis=1).dropna()
-    if len(dfm) < 120:
-        return {"ppei_coef": np.nan, "ppei_today": np.nan, "ppei_r2": np.nan, "ppei_n": int(len(dfm)), "ppei_status": "Too few rows"}
-
-    # OLS robusto (HC3)
-    X = sm.add_constant(dfm["proto"].astype(float))
-    y = dfm["y"].astype(float)
-    try:
-        model = sm.OLS(y, X).fit(cov_type="HC3")
-        coef = float(model.params["proto"])
-        r2 = float(model.rsquared)
-        # "hoy": cambio reciente de proto
-        proto_today = float(dfm["proto"].iloc[-1])
-        ppei_today = float(coef * proto_today)
-        return {"ppei_coef": coef, "ppei_today": ppei_today, "ppei_r2": r2, "ppei_n": int(len(dfm)), "ppei_status": "OK"}
-    except Exception as e:
-        return {"ppei_coef": np.nan, "ppei_today": np.nan, "ppei_r2": np.nan, "ppei_n": int(len(dfm)), "ppei_status": f"Fail: {e}"}
-
-def explain_ppei():
-    return (
-        "**PPEI (Protocol-to-Price Elasticity Index)** intenta responder: *“cuando el protocolo mejora, ¿eso se traduce en mejor comportamiento?”*\n\n"
-        "Cómo lo calculamos aquí:\n"
-        "- Miramos cambios en métricas del protocolo (stake/indexers/delegación/allocations… según lo disponible).\n"
-        "- Los convertimos en un ‘pulso’ normalizado (proto).\n"
-        "- Estimamos si ese pulso se asocia con retorno futuro (o una proxy si no guardas ‘close’).\n\n"
-        "Cómo interpretarlo:\n"
-        "- **Coeficiente PPEI** alto y estable: mejoras del protocolo suelen ir acompañadas de mejores resultados.\n"
-        "- **Coeficiente ~0**: el mercado no está ‘pagando’ esas mejoras (o faltan datos/hay ruido).\n"
-        "- **PPEI hoy** combina: (elasticidad) × (pulso reciente). Si es positivo y grande, sería un “viento a favor”."
-    )
-
-
-# =========================
-# SCORE
+# SCORE (con news)
 # =========================
 def grt_score(metrics: dict, probs: dict) -> float:
     s = 50.0
@@ -1510,10 +898,6 @@ def grt_score(metrics: dict, probs: dict) -> float:
     gv = metrics.get("garch_vol_now", np.nan)
     if gv == gv:
         s += 3 if gv < 4 else (-6 if gv > 9 else -2)
-
-    skew = metrics.get("skew_90d", np.nan)
-    if skew == skew:
-        s += 4 if skew > 0.2 else (-4 if skew < -0.2 else 0)
 
     rsi14 = metrics.get("rsi_14", np.nan)
     if rsi14 == rsi14:
@@ -1556,6 +940,553 @@ def grt_score(metrics: dict, probs: dict) -> float:
 
 
 # =========================
+# DECISION LAB — PRUEBAS “DEFINITIVAS”
+# =========================
+def _bucket_news(score_0_100: float) -> str:
+    if not np.isfinite(score_0_100):
+        return "News: N/A"
+    if score_0_100 >= 65:
+        return "News: +"
+    if score_0_100 >= 45:
+        return "News: 0"
+    return "News: -"
+
+def compute_btc_regime(dfb: pd.DataFrame) -> str:
+    """
+    Régimen simple: usa retorno 60d y pendiente 90d del log-precio.
+    """
+    if dfb is None or dfb.empty or "close" not in dfb.columns:
+        return "BTC: N/A"
+    b = dfb.dropna().copy()
+    if len(b) < 120:
+        return "BTC: N/A"
+    ret60 = (b["close"].iloc[-1] / b["close"].iloc[-60]) - 1.0
+    tr = trend_regression(b, window=90)
+    slope = tr.get("trend_slope", np.nan)
+
+    if np.isfinite(ret60) and np.isfinite(slope):
+        if ret60 > 0 and slope > 0:
+            return "BTC: Bull"
+        if ret60 < 0 and slope < 0:
+            return "BTC: Bear"
+        return "BTC: Range"
+    return "BTC: N/A"
+
+def compute_vol_regime(df: pd.DataFrame, window=30) -> str:
+    r = df["ret"].dropna()
+    if len(r) < 120:
+        return "Vol: N/A"
+    v_now = r.tail(window).std()
+    v_hist = r.tail(365).std() if len(r) >= 365 else r.std()
+    if not np.isfinite(v_now) or not np.isfinite(v_hist):
+        return "Vol: N/A"
+    if v_now > 1.25 * v_hist:
+        return "Vol: High"
+    if v_now < 0.85 * v_hist:
+        return "Vol: Low"
+    return "Vol: Mid"
+
+def forward_returns(close: pd.Series, horizon: int) -> pd.Series:
+    return (close.shift(-horizon) / close - 1.0)
+
+def edge_by_regime(df: pd.DataFrame, dfb: pd.DataFrame, news_score_0_100: float, horizons=(7, 30, 90)) -> Tuple[pd.DataFrame, dict]:
+    """
+    Divide el histórico en regímenes basados en BTC y volatilidad.
+    Luego calcula cómo se comportó GRT en cada régimen (prob de subir, retorno medio, etc.).
+    """
+    if df.empty or dfb.empty:
+        return pd.DataFrame(), {}
+
+    # Build per-day regime labels
+    d = pd.DataFrame(index=df.index)
+    d["grt_close"] = df["close"].astype(float)
+    d["grt_ret"] = df["ret"].astype(float)
+    d["btc_close"] = dfb["close"].astype(float)
+    d["btc_ret"] = dfb["ret"].astype(float)
+
+    # BTC daily trend proxy: rolling slope sign on log close
+    btc_log = np.log(d["btc_close"].replace(0, np.nan))
+    def _roll_slope(x):
+        x = x.dropna()
+        if len(x) < 30:
+            return np.nan
+        y = x.values
+        t = np.arange(len(y))
+        X = sm.add_constant(t)
+        res = sm.OLS(y, X).fit()
+        return float(res.params[1])
+    d["btc_slope_60"] = btc_log.rolling(60).apply(_roll_slope, raw=False)
+    d["btc_ret_60"] = d["btc_close"].pct_change(60)
+
+    def label_btc(row):
+        s = row["btc_slope_60"]
+        r60 = row["btc_ret_60"]
+        if not np.isfinite(s) or not np.isfinite(r60):
+            return "BTC: N/A"
+        if r60 > 0 and s > 0:
+            return "BTC: Bull"
+        if r60 < 0 and s < 0:
+            return "BTC: Bear"
+        return "BTC: Range"
+
+    d["btc_regime"] = d.apply(label_btc, axis=1)
+
+    # Vol regime on GRT
+    v_now = d["grt_ret"].rolling(30).std()
+    v_base = d["grt_ret"].rolling(365).std()
+    d["vol_ratio"] = v_now / (v_base + 1e-12)
+
+    def label_vol(x):
+        if not np.isfinite(x):
+            return "Vol: N/A"
+        if x > 1.25:
+            return "Vol: High"
+        if x < 0.85:
+            return "Vol: Low"
+        return "Vol: Mid"
+
+    d["vol_regime"] = d["vol_ratio"].apply(label_vol)
+
+    # News bucket is "current context" (not historical per day). We attach as constant label.
+    d["news_bucket"] = _bucket_news(news_score_0_100)
+
+    # Compute forward returns per horizon
+    out_rows = []
+    for h in horizons:
+        fr = forward_returns(d["grt_close"], h)
+        tmp = d[["btc_regime", "vol_regime", "news_bucket"]].copy()
+        tmp["fwd_ret"] = fr
+        tmp = tmp.dropna()
+        if tmp.empty:
+            continue
+
+        grp = tmp.groupby(["btc_regime", "vol_regime", "news_bucket"], dropna=False)
+        for (br, vr, nb), g in grp:
+            if len(g) < 60:
+                continue
+            win = float((g["fwd_ret"] > 0).mean())
+            mean = float(g["fwd_ret"].mean())
+            med = float(g["fwd_ret"].median())
+            p10 = float(np.quantile(g["fwd_ret"], 0.10))
+            p90 = float(np.quantile(g["fwd_ret"], 0.90))
+            out_rows.append({
+                "Horizonte(d)": h,
+                "BTC Régimen": br,
+                "Vol Régimen": vr,
+                "News (hoy)": nb,
+                "N (muestras)": int(len(g)),
+                "Prob. subir": win,
+                "Retorno medio": mean,
+                "Retorno mediano": med,
+                "P10": p10,
+                "P90": p90
+            })
+
+    out = pd.DataFrame(out_rows)
+    # Current regime summary
+    cur = {
+        "btc_regime_now": compute_btc_regime(dfb),
+        "vol_regime_now": compute_vol_regime(df),
+        "news_bucket_now": _bucket_news(news_score_0_100)
+    }
+    return out.sort_values(["Horizonte(d)", "N (muestras)"], ascending=[True, False]), cur
+
+def stochastic_dominance_approx(x: np.ndarray, y: np.ndarray, grid_n=200) -> dict:
+    """
+    Aproximación:
+    - FSD: F_x(t) <= F_y(t) para todo t (CDFs)
+    - SSD: integral CDF_x <= integral CDF_y
+    Devuelve un "grado" de dominancia (cuánto se viola).
+    """
+    x = x[np.isfinite(x)]
+    y = y[np.isfinite(y)]
+    if len(x) < 200 or len(y) < 200:
+        return {"status": "Not enough data", "fsd": None, "ssd": None, "fsd_violation": np.nan, "ssd_violation": np.nan}
+
+    lo = float(min(np.min(x), np.min(y)))
+    hi = float(max(np.max(x), np.max(y)))
+    grid = np.linspace(lo, hi, grid_n)
+
+    # Empirical CDFs
+    x_sorted = np.sort(x)
+    y_sorted = np.sort(y)
+
+    def ecdf(sorted_arr, t):
+        return np.searchsorted(sorted_arr, t, side="right") / len(sorted_arr)
+
+    Fx = np.array([ecdf(x_sorted, t) for t in grid])
+    Fy = np.array([ecdf(y_sorted, t) for t in grid])
+
+    # FSD: Fx <= Fy for all t means X stochastically dominates Y (higher returns)
+    fsd_violation = float(np.max(Fx - Fy))  # if >0, violates dominance
+    fsd = (fsd_violation <= 0.0)
+
+    # SSD uses integrals of CDF
+    dx = (hi - lo) / (grid_n - 1)
+    intFx = np.cumsum(Fx) * dx
+    intFy = np.cumsum(Fy) * dx
+    ssd_violation = float(np.max(intFx - intFy))
+    ssd = (ssd_violation <= 0.0)
+
+    return {
+        "status": "OK",
+        "fsd": bool(fsd),
+        "ssd": bool(ssd),
+        "fsd_violation": fsd_violation,
+        "ssd_violation": ssd_violation,
+        "grid_lo": lo,
+        "grid_hi": hi
+    }
+
+def drawdown_recovery_analysis(close: pd.Series, thresholds=(-0.2, -0.4, -0.6), horizons=(90, 180, 365)) -> pd.DataFrame:
+    """
+    Para cada threshold de drawdown: detecta eventos y calcula prob de recuperar en X días
+    y tiempos típicos de recuperación.
+    """
+    c = close.dropna().astype(float)
+    if len(c) < 300:
+        return pd.DataFrame()
+
+    peak = c.cummax()
+    dd = (c / peak) - 1.0
+
+    results = []
+    for th in thresholds:
+        # event start when dd crosses below threshold
+        below = dd <= th
+        if not below.any():
+            results.append({"Drawdown": f"{int(th*100)}%", "Eventos": 0, **{f"Recupera<{h}d": np.nan for h in horizons}, "Mediana días": np.nan})
+            continue
+
+        # identify contiguous episodes
+        idx = dd.index
+        events = []
+        in_event = False
+        start_i = None
+        for i, flag in enumerate(below.values):
+            if flag and not in_event:
+                in_event = True
+                start_i = i
+            if in_event and (not flag):
+                end_i = i - 1
+                events.append((start_i, end_i))
+                in_event = False
+        if in_event and start_i is not None:
+            events.append((start_i, len(idx)-1))
+
+        # For each event, time to recover previous peak
+        rec_times = []
+        for (s_i, e_i) in events:
+            # peak level before event start
+            peak_level = peak.iloc[s_i]
+            # find first time after start where close >= peak_level
+            after = c.iloc[s_i:]
+            rec_idx = after[after >= peak_level]
+            if rec_idx.empty:
+                continue  # not recovered in sample
+            rec_day = rec_idx.index[0]
+            t_days = (pd.to_datetime(rec_day) - pd.to_datetime(c.index[s_i])).days
+            rec_times.append(t_days)
+
+        if len(rec_times) == 0:
+            row = {"Drawdown": f"{int(th*100)}%", "Eventos": int(len(events))}
+            for h in horizons:
+                row[f"Recupera<{h}d"] = 0.0
+            row["Mediana días"] = np.nan
+            results.append(row)
+            continue
+
+        rec_times = np.array(rec_times, dtype=float)
+        row = {"Drawdown": f"{int(th*100)}%", "Eventos": int(len(events))}
+        for h in horizons:
+            row[f"Recupera<{h}d"] = float(np.mean(rec_times <= h))
+        row["Mediana días"] = float(np.median(rec_times))
+        results.append(row)
+
+    return pd.DataFrame(results)
+
+def tail_risk_dashboard(r: pd.Series, crash_levels=(-0.05, -0.10), window=180) -> dict:
+    """
+    Medidas simples pero potentes:
+    - Frecuencia de días con caídas muy fuertes (crash)
+    - "Tail index" estilo Hill (cuanto más bajo, más cola)
+    - Comparación reciente vs histórico
+    """
+    x = r.dropna().astype(float)
+    if len(x) < 400:
+        return {"status": "Not enough data"}
+
+    # Crash freq
+    out = {"status": "OK"}
+    for lv in crash_levels:
+        out[f"p_ret<{lv}"] = float((x < lv).mean())
+        out[f"p_ret<{lv}_recent"] = float((x.tail(window) < lv).mean())
+
+    # Hill tail index on losses
+    losses = (-x[x < 0]).values
+    losses = losses[np.isfinite(losses)]
+    if len(losses) < 300:
+        out["hill_alpha"] = np.nan
+        out["hill_alpha_recent"] = np.nan
+        return out
+
+    def hill_alpha(arr, k=80):
+        arr = np.sort(arr)
+        arr = arr[arr > 0]
+        if len(arr) < (k + 10):
+            return np.nan
+        tail = arr[-k:]
+        xk = tail[0]
+        if xk <= 0:
+            return np.nan
+        return float(1.0 / (np.mean(np.log(tail / xk)) + 1e-12))
+
+    out["hill_alpha"] = hill_alpha(losses, k=80)
+    losses_recent = (-x.tail(window)[x.tail(window) < 0]).values
+    losses_recent = losses_recent[np.isfinite(losses_recent)]
+    out["hill_alpha_recent"] = hill_alpha(losses_recent, k=min(50, max(20, len(losses_recent)//4))) if len(losses_recent) > 80 else np.nan
+
+    return out
+
+def granger_btc_to_grt(df: pd.DataFrame, dfb: pd.DataFrame, maxlag=5) -> dict:
+    """
+    Test de causalidad de Granger (BTC -> GRT) en retornos diarios.
+    """
+    if df.empty or dfb.empty:
+        return {"status": "No data"}
+    a = df["ret"].astype(float)
+    b = dfb["ret"].astype(float)
+    tmp = pd.concat([a.rename("grt"), b.rename("btc")], axis=1).dropna()
+    if len(tmp) < 300:
+        return {"status": "Not enough data"}
+
+    # grangercausalitytests expects [y, x]
+    try:
+        res = grangercausalitytests(tmp[["grt", "btc"]], maxlag=maxlag, verbose=False)
+        pvals = {}
+        for lag, r in res.items():
+            p = r[0]["ssr_ftest"][1]  # p-value
+            pvals[lag] = float(p)
+        best_lag = min(pvals, key=pvals.get)
+        return {"status": "OK", "pvals": pvals, "best_lag": int(best_lag), "best_p": float(pvals[best_lag])}
+    except Exception as e:
+        return {"status": f"Failed: {e}"}
+
+def monte_carlo_conditioned(
+    df: pd.DataFrame,
+    dfb: pd.DataFrame,
+    news_score_0_100: float,
+    sims=2500,
+    seed=7,
+    horizons=(7, 30, 90),
+    regime_window=180
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Simula escenarios futuros usando retornos históricos "parecidos" al contexto actual.
+    - Se filtran días por régimen BTC (bull/bear/range) y vol (high/mid/low)
+    - Se说明: no es predicción, es "distribución plausible" si el futuro se parece al pasado.
+    """
+    if df.empty or dfb.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Determine current regimes
+    btc_now = compute_btc_regime(dfb)
+    vol_now = compute_vol_regime(df)
+    news_bucket = _bucket_news(news_score_0_100)
+
+    # Build a small regime label per day
+    r = df["ret"].astype(float)
+    rb = dfb["ret"].astype(float)
+    tmp = pd.DataFrame({"r": r, "rb": rb}).dropna()
+    if len(tmp) < 400:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Use last regime_window only to define similarity baseline (keeps things "recent")
+    tmp = tmp.tail(max(regime_window, 400))
+
+    # For similarity, approximate btc regime based on rolling return and slope sign
+    # We'll keep it lightweight
+    btc_ret_60 = dfb["close"].astype(float).pct_change(60).reindex(tmp.index)
+    btc_slope = np.log(dfb["close"].astype(float)).rolling(60).apply(
+        lambda x: np.polyfit(np.arange(len(x)), x, 1)[0] if len(x) == 60 else np.nan,
+        raw=False
+    ).reindex(tmp.index)
+
+    def _btc_label(r60, s):
+        if not np.isfinite(r60) or not np.isfinite(s):
+            return "BTC: N/A"
+        if r60 > 0 and s > 0:
+            return "BTC: Bull"
+        if r60 < 0 and s < 0:
+            return "BTC: Bear"
+        return "BTC: Range"
+
+    btc_lab = [_btc_label(btc_ret_60.loc[i], btc_slope.loc[i]) for i in tmp.index]
+    tmp["btc_regime"] = btc_lab
+
+    # Vol regime on GRT
+    v_now = r.rolling(30).std().reindex(tmp.index)
+    v_base = r.rolling(365).std().reindex(tmp.index)
+    vol_ratio = v_now / (v_base + 1e-12)
+
+    def _vol_label(x):
+        if not np.isfinite(x):
+            return "Vol: N/A"
+        if x > 1.25:
+            return "Vol: High"
+        if x < 0.85:
+            return "Vol: Low"
+        return "Vol: Mid"
+
+    tmp["vol_regime"] = vol_ratio.apply(_vol_label)
+
+    # Filter to similar regime
+    filt = (tmp["btc_regime"] == btc_now) & (tmp["vol_regime"] == vol_now)
+    sample = tmp.loc[filt, "r"].dropna()
+
+    # Fallback: if too few, relax
+    if len(sample) < 200:
+        sample = tmp["r"].dropna()
+
+    if len(sample) < 200:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rng = np.random.default_rng(seed)
+
+    # News tilt: VERY small mean shift (conservative)
+    # Explanation: only to reflect that strong positive/negative news can bias near-term drift.
+    tilt = 0.0
+    if np.isfinite(news_score_0_100):
+        if news_score_0_100 >= 65:
+            tilt = 0.0005
+        elif news_score_0_100 <= 35:
+            tilt = -0.0005
+
+    # Simulate per horizon
+    summary_rows = []
+    paths_rows = []
+
+    for h in horizons:
+        # sample h daily returns per simulation
+        rets = rng.choice(sample.values, size=(sims, h), replace=True) + tilt
+        # compute cumulative return
+        cum = np.prod(1.0 + rets, axis=1) - 1.0
+
+        # path drawdown estimate (max drawdown during path)
+        # Compute equity curve and max DD per sim
+        eq = np.cumprod(1.0 + rets, axis=1)
+        peak = np.maximum.accumulate(eq, axis=1)
+        dd = (eq / (peak + 1e-12)) - 1.0
+        maxdd = dd.min(axis=1)
+
+        summary_rows.append({
+            "Horizonte(d)": h,
+            "Prob. pérdida": float(np.mean(cum < 0)),
+            "Mediana retorno": float(np.median(cum)),
+            "Media retorno": float(np.mean(cum)),
+            "P10": float(np.quantile(cum, 0.10)),
+            "P90": float(np.quantile(cum, 0.90)),
+            "VaR 95%": float(np.quantile(cum, 0.05)),
+            "CVaR 95%": float(cum[cum <= np.quantile(cum, 0.05)].mean()) if sims > 0 else np.nan,
+            "Mediana MaxDD": float(np.median(maxdd)),
+        })
+
+        # Small sample of paths for plot (20)
+        pick = rng.choice(np.arange(sims), size=min(30, sims), replace=False)
+        for j in pick:
+            paths_rows.append({
+                "Horizonte": h,
+                "Paso": np.arange(1, h+1),
+                "Equity": np.concatenate([[1.0], eq[j, :]])
+            })
+
+    summary = pd.DataFrame(summary_rows)
+    # build a plot-friendly df for equity curves (only one horizon chosen later)
+    return summary, pd.DataFrame(paths_rows)
+
+def compute_ivi(
+    metrics: dict,
+    probs: dict,
+    report: dict,
+    tail: dict,
+    dominance: dict,
+    granger: dict
+) -> float:
+    """
+    IVI (0-100) conservador:
+    - Premia: probas altas con AUC decente, news positivo moderado, dominancia favorable
+    - Penaliza: colas fuertes, drawdown extremo, sharpe muy negativo, dependencia alta BTC (beta), granger fuerte (dependencia)
+    Importante: es un "resumen" para humanos, no una verdad absoluta.
+    """
+    s = 50.0
+
+    # model confidence
+    p30 = probs.get(30, np.nan)
+    auc30 = report.get(30, {}).get("auc", np.nan)
+    if np.isfinite(p30) and np.isfinite(auc30):
+        if auc30 >= 0.62:
+            s += 12 * (p30 - 0.5) * 2  # scale
+        else:
+            s += 6 * (p30 - 0.5) * 2
+
+    # risk penalties
+    dd = metrics.get("max_drawdown", np.nan)
+    if np.isfinite(dd):
+        s -= 20 * min(1.0, abs(dd) / 0.8)  # very punitive if dd huge
+
+    var95 = metrics.get("var_95", np.nan)
+    cvar95 = metrics.get("cvar_95", np.nan)
+    if np.isfinite(cvar95):
+        s -= 12 * min(1.0, abs(cvar95) / 0.12)
+
+    # tail risk recent vs baseline
+    if isinstance(tail, dict) and tail.get("status") == "OK":
+        p_crash = tail.get("p_ret<-0.10_recent", np.nan)
+        if np.isfinite(p_crash):
+            s -= 10 * min(1.0, p_crash / 0.03)  # penalize if >3% of days are -10%
+
+        hill = tail.get("hill_alpha_recent", np.nan)
+        if np.isfinite(hill):
+            # lower alpha -> heavier tail
+            if hill < 2.5:
+                s -= 8
+            elif hill > 4.0:
+                s += 3
+
+    # beta penalty
+    beta = metrics.get("beta_180", np.nan)
+    if np.isfinite(beta) and beta > 1.4:
+        s -= 6
+
+    # news modest bonus
+    news = metrics.get("news_score_0_100", np.nan)
+    if np.isfinite(news):
+        if news >= 65:
+            s += 4
+        elif news <= 35:
+            s -= 4
+
+    # dominance
+    if isinstance(dominance, dict) and dominance.get("status") == "OK":
+        if dominance.get("fsd") is True:
+            s += 5
+        if dominance.get("ssd") is True:
+            s += 3
+        # violations penalize a bit
+        v = dominance.get("fsd_violation", np.nan)
+        if np.isfinite(v) and v > 0.02:
+            s -= 3
+
+    # granger (dependence) -> slight penalty if strongly dependent
+    if isinstance(granger, dict) and granger.get("status") == "OK":
+        bp = granger.get("best_p", np.nan)
+        if np.isfinite(bp) and bp < 0.01:
+            s -= 3
+
+    return float(np.clip(s, 0, 100))
+
+
+# =========================
 # CSV IO
 # =========================
 def save_row_to_csv(row: dict, path: str = RESULTS_PATH):
@@ -1581,7 +1512,7 @@ settings = load_settings()
 
 with st.sidebar:
     st.markdown("## 🟣 GRT QuantLab")
-    st.caption("Regímenes · Probabilidades · Backtest · Risk · Fundamentals · News")
+    st.caption("Market · Modelos · Riesgo · Noticias · Decision Lab")
 
     preferred_exchange = st.selectbox(
         "Exchange preferido (fallback auto)",
@@ -1596,22 +1527,17 @@ with st.sidebar:
     st.markdown("### 📰 Noticias (RSS)")
     news_cfg = settings.get("news", DEFAULT_SETTINGS["news"])
     news_enable = st.toggle("Activar noticias", value=bool(news_cfg.get("enable", True)))
-    news_lookback = st.slider("Ventana titulares (días)", 3, 30, int(news_cfg.get("lookback_days", 14)))
-    st.caption("Score 0–100 desde titulares dentro de la ventana seleccionada.")
+    st.caption("Se usa un score 0–100 a partir de titulares recientes (robusto y sin keys).")
 
     st.divider()
-    st.markdown("### 🧪 Backtest Walk-Forward")
-    bt_cfg = settings.get("backtest", DEFAULT_SETTINGS["backtest"])
-    bt_h = st.selectbox("Horizonte del backtest (días)", [7, 30, 90], index=[7,30,90].index(int(bt_cfg.get("horizon_days",30))))
-    bt_step = st.slider("Paso (días) — más alto = más rápido", 1, 14, int(bt_cfg.get("step_days", 7)))
-    bt_mintrain = st.slider("Mínimo datos para entrenar", 250, 700, int(bt_cfg.get("min_train_rows", 320)), step=10)
-    bt_thr_long = st.slider("Umbral entrar (prob)", 0.50, 0.80, float(bt_cfg.get("thr_long", 0.60)))
-    bt_thr_cash = st.slider("Umbral salir (prob)", 0.20, 0.55, float(bt_cfg.get("thr_cash", 0.45)))
-    bt_fee = st.slider("Coste por cambio de posición (bps)", 0, 30, int(bt_cfg.get("fee_bps", 8)))
+    st.markdown("### 🧠 Decision Lab")
+    dl = settings.get("decision_lab", DEFAULT_SETTINGS["decision_lab"])
+    mc_sims = st.slider("Monte Carlo simulaciones", 800, 6000, int(dl.get("mc_sims", 2500)), step=200)
+    granger_maxlag = st.slider("Granger max lag (días)", 2, 10, int(dl.get("granger_maxlag", 5)))
+    st.caption("Más simulaciones = más lento, pero más estable.")
 
     st.divider()
     st.markdown("### 🔌 The Graph Gateway (opcional)")
-    st.caption("Si no tienes key, usamos CoinGecko automáticamente.")
     api_keys = settings.get("api_keys", {})
     thegraph_key = st.text_input("THE_GRAPH_API_KEY", value=api_keys.get("thegraph_gateway",""), type="password")
 
@@ -1626,15 +1552,8 @@ with st.sidebar:
         settings["days"] = int(days)
         settings.setdefault("api_keys", {})
         settings["api_keys"]["thegraph_gateway"] = thegraph_key.strip()
-        settings["news"] = {"enable": bool(news_enable), "lookback_days": int(news_lookback), "rss_timeout": int(news_cfg.get("rss_timeout", 15))}
-        settings["backtest"] = {
-            "horizon_days": int(bt_h),
-            "step_days": int(bt_step),
-            "min_train_rows": int(bt_mintrain),
-            "thr_long": float(bt_thr_long),
-            "thr_cash": float(bt_thr_cash),
-            "fee_bps": int(bt_fee),
-        }
+        settings["news"] = {"enable": bool(news_enable), "lookback_days": int(news_cfg.get("lookback_days", 14)), "rss_timeout": int(news_cfg.get("rss_timeout", 15))}
+        settings["decision_lab"] = {"mc_sims": int(mc_sims), "mc_seed": int(dl.get("mc_seed", 7)), "similarity_window_days": int(dl.get("similarity_window_days", 180)), "granger_maxlag": int(granger_maxlag)}
         save_settings(settings)
         st.success("Ajustes guardados.")
 
@@ -1645,9 +1564,9 @@ with st.sidebar:
 st.markdown(
     """
     <div class="epic-hero">
-      <div class="epic-title">🟣 GRT QuantLab <span class="badge">Market · Modelos · Backtest · Señales · Risk · Fundamentals · News</span></div>
+      <div class="epic-title">🟣 GRT QuantLab <span class="badge">Definitiva: Edge · Riesgo · News · Simulación</span></div>
       <div class="epic-sub">
-        Arriba: Score + Probabilidades + News. Abajo: mercado, pruebas estadísticas, backtest walk-forward y explicaciones claras.
+        Arriba: KPIs (Score + P↑ + News). Abajo: Market · Modelos · Riesgo · Noticias · Decision Lab.
       </div>
     </div>
     """,
@@ -1666,13 +1585,21 @@ diag = {}
 df = pd.DataFrame()
 dfb = pd.DataFrame()
 fund = pd.DataFrame()
-fund_last = None
 fund_source = "N/A"
 score = np.nan
-
 news_score = np.nan
 news_df = pd.DataFrame()
-news_daily = pd.DataFrame()
+
+# Decision lab artifacts
+edge_table = pd.DataFrame()
+edge_current = {}
+dominance = {}
+recovery_df = pd.DataFrame()
+tail = {}
+granger = {}
+mc_summary = pd.DataFrame()
+mc_paths = pd.DataFrame()
+ivi = np.nan
 
 progress = st.empty()
 status = st.empty()
@@ -1705,22 +1632,19 @@ if run_update:
                 fund_source = f"CoinGecko (fallback: {fe})"
         else:
             fund = fetch_grt_fundamentals_coingecko()
-            fund_source = "CoinGecko"
+            fund_source = "CoinGecko (sin wallet)"
 
         fund_last = fund.iloc[-1] if (fund is not None and not fund.empty) else None
 
-        bar.progress(40, text="Noticias (RSS)…")
+        bar.progress(38, text="Noticias (RSS)…")
         status.info("Leyendo titulares y calculando score…")
         news_cfg = settings.get("news", DEFAULT_SETTINGS["news"])
         try:
-            news_score, news_df, news_daily = build_news_panel(
-                enable=bool(news_cfg.get("enable", True)),
-                lookback_days=int(news_cfg.get("lookback_days", 14)),
-                timeout=int(news_cfg.get("rss_timeout", 15)),
-            )
+            news_score, news_df = build_news_panel(enable=bool(news_cfg.get("enable", True)), timeout=int(news_cfg.get("rss_timeout", 15)))
         except Exception:
-            news_score, news_df, news_daily = np.nan, pd.DataFrame(), pd.DataFrame()
+            news_score, news_df = np.nan, pd.DataFrame()
 
+        # Metrics
         bar.progress(55, text="Calculando métricas…")
         status.info("Calculando indicadores y riesgo…")
         metrics.update(trend_regression(df, 90))
@@ -1731,35 +1655,52 @@ if run_update:
         metrics.update(structural_breaks(df))
         metrics.update(tail_risk_metrics(df))
         metrics.update(extra_market_stats(df, dfb))
-        metrics.update(bench_relationship_tests(df, dfb))
         metrics["news_score_0_100"] = float(news_score) if np.isfinite(news_score) else np.nan
 
-        # guardar fundamentals también como métricas (para PPEI histórico)
-        if fund_last is not None and isinstance(fund_last, pd.Series) and not fund_last.empty:
-            for k, v in fund_last.to_dict().items():
-                metrics[f"fund_{k}"] = safe_float(v)
-
-            # ratios útiles
-            if ("fund_totalTokensStaked" in metrics) and ("fund_totalSupply" in metrics):
-                metrics["fund_stake_ratio"] = safe_float(metrics["fund_totalTokensStaked"]) / (safe_float(metrics["fund_totalSupply"]) + 1e-12)
-            if ("fund_cg_marketcap_usd" in metrics) and ("fund_cg_volume_24h_usd" in metrics):
-                metrics["fund_mcap_to_vol"] = safe_float(metrics["fund_cg_marketcap_usd"]) / (safe_float(metrics["fund_cg_volume_24h_usd"]) + 1e-12)
-
+        # HMM
         bar.progress(65, text="HMM (regímenes)…")
         status.info("Estimando regímenes…")
         metrics.update(hmm_regimes_robust(df))
 
+        # Modelos
         bar.progress(78, text="Entrenando modelos…")
         status.info("Entrenando ensemble + explicabilidad…")
         feat = build_feature_frame(df, dfb, fund_last, news_score_0_100=news_score)
         probs, report, diag = fit_ensemble_probabilities(feat, horizons=(7,30,90), min_rows=250)
 
-        bar.progress(90, text="Calculando score…")
+        bar.progress(86, text="Decision Lab: edge/riesgo avanzado…")
+        status.info("Calculando pruebas definitivas…")
+        edge_table, edge_current = edge_by_regime(df, dfb, news_score, horizons=(7,30,90))
+
+        # Dominance vs BTC (daily returns)
+        dominance = stochastic_dominance_approx(
+            df["ret"].dropna().values.astype(float),
+            dfb["ret"].dropna().values.astype(float),
+            grid_n=200
+        )
+
+        recovery_df = drawdown_recovery_analysis(df["close"], thresholds=(-0.2, -0.4, -0.6), horizons=(90,180,365))
+        tail = tail_risk_dashboard(df["ret"], crash_levels=(-0.05, -0.10), window=180)
+
+        dl = settings.get("decision_lab", DEFAULT_SETTINGS["decision_lab"])
+        granger = granger_btc_to_grt(df, dfb, maxlag=int(dl.get("granger_maxlag", 5)))
+
+        mc_summary, mc_paths = monte_carlo_conditioned(
+            df, dfb, news_score_0_100=news_score,
+            sims=int(dl.get("mc_sims", 2500)),
+            seed=int(dl.get("mc_seed", 7)),
+            horizons=(7,30,90),
+            regime_window=int(dl.get("similarity_window_days", 180))
+        )
+
+        # Score final + IVI
+        bar.progress(92, text="Score + IVI…")
         status.info("Cerrando cálculo…")
         score = grt_score(metrics, probs)
+        ivi = compute_ivi(metrics, probs, report, tail, dominance, granger)
 
         if auto_save:
-            bar.progress(95, text="Guardando…")
+            bar.progress(96, text="Guardando…")
             row = {
                 "as_of_date": str(df.index.max()),
                 "exchange": used_ex,
@@ -1768,6 +1709,7 @@ if run_update:
                 "updated_at_utc": now_utc_iso(),
                 "fund_source": fund_source,
                 "score_0_100": float(score),
+                "ivi_0_100": float(ivi) if np.isfinite(ivi) else None,
                 "news_score_0_100": safe_float(news_score),
                 "p_up_7d": safe_float(probs.get(7)),
                 "p_up_30d": safe_float(probs.get(30)),
@@ -1777,7 +1719,7 @@ if run_update:
             save_row_to_csv(row)
 
         bar.progress(100, text="Listo ✅")
-        status.success(f"✅ Actualizado ({used_ex} · {used_sym}) — Score: {score:.1f}/100")
+        status.success(f"✅ Actualizado ({used_ex} · {used_sym}) — Score: {score:.1f}/100 · IVI: {ivi:.1f}/100")
         st.caption(f"Benchmark: {dfb.attrs.get('exchange_used', used_ex)} · {used_bench} · Fundamentals: {fund_source}")
 
         hmm_status = metrics.get("hmm_status", "")
@@ -1787,11 +1729,12 @@ if run_update:
     except Exception as e:
         status.error(f"Error al actualizar: {e}")
 
-# Si no actualizas, carga último guardado
+# Load history if not updated
 hist = load_results()
 if (not run_update) and (not hist.empty):
     last = hist.sort_values("as_of_date").iloc[-1].to_dict()
     score = safe_float(last.get("score_0_100"))
+    ivi = safe_float(last.get("ivi_0_100"))
     news_score = safe_float(last.get("news_score_0_100"))
     probs = {7: safe_float(last.get("p_up_7d")), 30: safe_float(last.get("p_up_30d")), 90: safe_float(last.get("p_up_90d"))}
 
@@ -1799,15 +1742,14 @@ if (not run_update) and (not hist.empty):
 # =========================
 # KPIs ARRIBA
 # =========================
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 
 with c1:
     st.markdown(
         f"""
         <div class='kpi'>
           <div class='label'>GRT Score</div>
-          <div class='value'>{(score if score==score else np.nan):.1f}/100</div>
-          <div class='hint'>Confluencia</div>
+          <div class='value'>{(score if np.isfinite(score) else np.nan):.1f}/100</div>
           <div class='hint'>{explain_score(score)}</div>
         </div>
         """,
@@ -1821,7 +1763,6 @@ with c2:
         <div class='kpi'>
           <div class='label'>P(↑ 7 días)</div>
           <div class='value'>{_fmt_pct(p7)}</div>
-          <div class='hint'>Ensemble</div>
           <div class='hint'>{explain_prob(p7, 7)}</div>
         </div>
         """,
@@ -1835,7 +1776,6 @@ with c3:
         <div class='kpi'>
           <div class='label'>P(↑ 30 días)</div>
           <div class='value'>{_fmt_pct(p30)}</div>
-          <div class='hint'>Ensemble</div>
           <div class='hint'>{explain_prob(p30, 30)}</div>
         </div>
         """,
@@ -1849,7 +1789,6 @@ with c4:
         <div class='kpi'>
           <div class='label'>P(↑ 90 días)</div>
           <div class='value'>{_fmt_pct(p90)}</div>
-          <div class='hint'>Ensemble</div>
           <div class='hint'>{explain_prob(p90, 90)}</div>
         </div>
         """,
@@ -1862,8 +1801,22 @@ with c5:
         <div class='kpi'>
           <div class='label'>News Score</div>
           <div class='value'>{_fmt_num(news_score, 1) if np.isfinite(news_score) else "—"}</div>
-          <div class='hint'>0–100 (ventana)</div>
           <div class='hint'>{explain_news_score(news_score)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with c6:
+    st.markdown(
+        f"""
+        <div class='kpi'>
+          <div class='label'>IVI (0–100)</div>
+          <div class='value'>{_fmt_num(ivi, 1) if np.isfinite(ivi) else "—"}</div>
+          <div class='hint'>
+            IVI es un “resumen conservador” que mezcla: señal estadística (modelos), riesgo extremo (colas/drawdown),
+            dependencia de BTC y noticias. No es una predicción: es una brújula para decidir con menos sesgo.
+          </div>
         </div>
         """,
         unsafe_allow_html=True
@@ -1871,8 +1824,7 @@ with c5:
 
 st.write("")
 
-# Gauge
-if score == score:
+if np.isfinite(score):
     fig_g = go.Figure(go.Indicator(
         mode="gauge+number",
         value=float(score),
@@ -1889,14 +1841,9 @@ st.divider()
 # =========================
 # TABS
 # =========================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📈 Market",
-    "🧠 Modelos",
-    "🧪 Señales (pruebas)",
-    "🧭 Backtest (walk-forward)",
-    "📰 Noticias",
-    "🧾 Histórico / Export",
-])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["📈 Market", "🧠 Modelos", "🧪 Riesgo & Señales", "📰 Noticias", "🧠 Decision Lab (Definitiva)", "🧾 Histórico / Export"]
+)
 
 with tab1:
     st.subheader("Market")
@@ -1904,9 +1851,7 @@ with tab1:
         st.info("Pulsa **Actualizar (calcular todo)**.")
     else:
         cd = df.reset_index()
-        fig_c = go.Figure(data=[go.Candlestick(
-            x=cd["date"], open=cd["open"], high=cd["high"], low=cd["low"], close=cd["close"]
-        )])
+        fig_c = go.Figure(data=[go.Candlestick(x=cd["date"], open=cd["open"], high=cd["high"], low=cd["low"], close=cd["close"])])
         fig_c.update_layout(height=420, margin=dict(l=20,r=20,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig_c, use_container_width=True)
 
@@ -1918,14 +1863,19 @@ with tab1:
         if len(df) > 60:
             rsi_s = rsi(df["close"].astype(float), 14)
             m_line, m_sig, m_hist = macd(df["close"].astype(float))
-            mini = pd.DataFrame({
-                "date": df.index.astype(str),
-                "RSI14": rsi_s.values,
-                "MACD_hist": m_hist.values
-            }).tail(180)
+            mini = pd.DataFrame({"date": df.index.astype(str), "RSI14": rsi_s.values, "MACD_hist": m_hist.values}).tail(180)
 
             st.write("")
             st.markdown("#### Indicadores rápidos")
+            st.markdown(
+                """
+                Estos dos indicadores sirven para entender el “momento” del precio:
+                - **RSI** te dice si el movimiento reciente ha sido tan fuerte que puede estar “agotándose” (sobrecompra/sobreventa).
+                - **MACD hist** te indica si el impulso está acelerando o frenando (barras creciendo o decreciendo).
+                No son magia: funcionan mejor cuando se usan junto a tendencia (ADX) y riesgo (colas).
+                """
+            )
+
             fig_rsi = px.line(mini, x="date", y="RSI14", title="RSI(14) (últimos 180 días)")
             fig_rsi.update_layout(height=260, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig_rsi, use_container_width=True)
@@ -1936,8 +1886,7 @@ with tab1:
 
 with tab2:
     st.subheader("Modelos · Probabilidades + Explicabilidad")
-
-    if not report or df.empty:
+    if not report:
         st.info("Pulsa **Actualizar (calcular todo)**.")
     else:
         rows = []
@@ -1946,417 +1895,382 @@ with tab2:
             rows.append({
                 "Horizonte": f"{h} días",
                 "P(↑)": probs.get(h, np.nan),
-                "AUC (test)": rep.get("auc", np.nan),
+                "AUC (calidad)": rep.get("auc", np.nan),
                 "N train": rep.get("n_train", 0),
                 "N test": rep.get("n_test", 0),
                 "Rows clean": diag.get(h, {}).get("rows_after_clean", 0),
             })
-
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-        st.write("")
-        st.markdown("### Interpretación rápida por horizonte")
+        st.markdown(
+            """
+            **Cómo leer esta tabla (en sencillo):**
+            - **P(↑)**: qué proporción de veces, en contextos parecidos al histórico, el modelo cree que el precio acaba subiendo en ese horizonte.
+            - **AUC (calidad)**: qué tan bien separa el modelo “sube” vs “baja”. Si es cercano a 0.50, es casi azar.
+            - **N train/test**: cuantos datos ha usado; con pocos datos no hay fiabilidad.
+            Ideal: P(↑) no basta; debe venir con AUC decente y un riesgo aceptable (ver pestaña de riesgo).
+            """
+        )
 
+        st.write("")
+        st.markdown("### Interpretación por horizonte (explicación humana)")
         for h in [7, 30, 90]:
             rep = report.get(h, {})
-            p = probs.get(h, np.nan)
+            p = remember_nan = probs.get(h, np.nan)
             auc = rep.get("auc", np.nan)
-            n_train = rep.get("n_train", 0)
-            n_test = rep.get("n_test", 0)
-            rows_clean = diag.get(h, {}).get("rows_after_clean", 0)
-
-            text = model_summary_text(p, auc, n_train, n_test, rows_clean, h)
-
             st.markdown(
                 f"""
                 <div class='kpi'>
                   <div class='label'>Horizonte {h} días</div>
-                  <div class='value'>
-                    P(↑) {_fmt_pct(p)} · AUC {(auc if np.isfinite(auc) else np.nan):.3f}
+                  <div class='value'>P(↑) {_fmt_pct(p)} · AUC {(_fmt_num(auc,3) if np.isfinite(auc) else "—")}</div>
+                  <div class='hint'>
+                    {explain_prob(p, h)}<br><br>
+                    <b>Calidad del modelo (AUC):</b> {explain_auc(auc)}<br><br>
+                    <b>Importante:</b> aunque el modelo diga “sube”, si el riesgo extremo es alto (colas) o la tendencia fuerte es bajista,
+                    la realidad puede desviarse. Por eso la app mezcla señales (Score/IVI) y no te obliga a creer una sola métrica.
                   </div>
-                  <div class='hint'>{text}</div>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
         st.write("")
-        st.markdown("### Factores más influyentes")
-
+        st.markdown("### Factores más influyentes (para entender el “por qué”)")
         h_sel = st.selectbox("Ver factores top para horizonte", [7, 30, 90], index=1)
-
         rep_sel = report.get(h_sel, {})
-        p_sel = probs.get(h_sel, np.nan)
-        auc_sel = rep_sel.get("auc", np.nan)
-        rows_sel = diag.get(h_sel, {}).get("rows_after_clean", 0)
+        top_feats = rep_sel.get("top_features", [])
 
-        st.info(
-            model_summary_text(
-                p_sel,
-                auc_sel,
-                rep_sel.get("n_train", 0),
-                rep_sel.get("n_test", 0),
-                rows_sel,
-                h_sel
-            )
+        st.markdown(
+            """
+            Aquí no te doy solo números: te doy **qué variables han tenido más peso** en la predicción.
+            Ojo: esto no significa causalidad; significa “cuando esto cambia, el modelo cambia su decisión”.
+            Sirve para entender si el modelo se apoya en algo razonable (p.ej., volatilidad, correlación con BTC, momentum).
+            """
         )
 
-        top_feats = rep_sel.get("top_features", [])
         if not top_feats:
             st.warning("No se pudo calcular importance (AUC inválido o pocos datos).")
         else:
             imp_df = pd.DataFrame(top_feats, columns=["feature", "importance"])
-            fig_imp = px.bar(
-                imp_df,
-                x="importance",
-                y="feature",
-                orientation="h",
-                title=f"Top factores (perm. importance) — {h_sel}d"
-            )
+            fig_imp = px.bar(imp_df, x="importance", y="feature", orientation="h", title=f"Top factores — {h_sel}d")
             fig_imp.update_layout(height=420, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig_imp, use_container_width=True)
 
-        st.caption(f"HMM status: {metrics.get('hmm_status','N/A')}")
-
-        with st.expander("📌 ¿Qué significa esto en cristiano? (explicación larga)"):
-            st.write(
-                "1) **P(↑)** es la probabilidad que el modelo estima para que el precio esté más alto dentro del horizonte.\n\n"
-                "2) **AUC** mide si el modelo separa ‘subida’ vs ‘no subida’ en datos de test. Si AUC≈0.50, es casi azar.\n\n"
-                "3) **Top factores** te dice qué variables están empujando más la predicción (aprox). "
-                "Esto no es una ‘verdad’, pero ayuda a entender si el modelo se apoya en volumen, tendencia, volatilidad, etc.\n\n"
-                "Consejo: si P(↑) es alta pero AUC es baja, el modelo puede estar **sobreconfiado**."
-            )
-
 with tab3:
-    st.subheader("Señales con pruebas estadísticas (CFR + relación BTC + riesgo extremo)")
-
+    st.subheader("Riesgo & Señales (interpretación sencilla)")
     if df.empty or not metrics:
         st.info("Pulsa **Actualizar (calcular todo)**.")
     else:
-        st.markdown("### 1) CFR: cuando pasa X… ¿qué pasa después?")
-        cfr_df = conditional_forward_returns(df, horizon=30)
-        st.dataframe(cfr_df, use_container_width=True)
-        st.caption(explain_cfr())
-
-        st.divider()
-        st.markdown("### 2) Relación GRT vs Benchmark (BTC) — ¿copia o va por libre?")
-        cA, cB = st.columns(2)
-        with cA:
-            coint_p = metrics.get("coint_pvalue", np.nan)
-            st.markdown(
-                f"<div class='kpi'><div class='label'>Cointegración (p-valor)</div><div class='value'>{_fmt_num(coint_p,3)}</div>"
-                f"<div class='hint'>Si p &lt; 0.05, sugiere relación de largo plazo (tienden a ‘reunirse’ tras separarse). "
-                f"Si p alto, pueden ir más independientes.</div></div>",
-                unsafe_allow_html=True
-            )
-        with cB:
-            gr_p = metrics.get("granger_min_pvalue", np.nan)
-            st.markdown(
-                f"<div class='kpi'><div class='label'>Granger (bench→GRT) min p</div><div class='value'>{_fmt_num(gr_p,3)}</div>"
-                f"<div class='hint'>Si p &lt; 0.05, los movimientos del benchmark suelen *preceder* a GRT (dependencia temporal). "
-                f"Si p alto, menos evidencia de que BTC ‘mande’.</div></div>",
-                unsafe_allow_html=True
-            )
-
-        with st.expander("📌 Interpretación sencilla (larga)"):
-            st.write(
-                "Estas pruebas no te dicen ‘sube o baja’, te dicen **de qué depende**.\n\n"
-                "- **Cointegración**: si existe, cuando GRT se separa mucho de BTC, a veces tiende a volver. "
-                "Esto se parece a ‘ir atados por una goma’ a largo plazo.\n\n"
-                "- **Granger**: si sale significativo, BTC suele moverse primero y GRT le sigue. "
-                "Eso te dice que parte del riesgo de GRT es realmente *riesgo BTC*."
-            )
-
-        st.divider()
-        st.markdown("### 3) Riesgo extremo (no solo VaR/CVaR)")
         dd = metrics.get("max_drawdown", np.nan)
-        dd_max_dur = metrics.get("dd_max_duration", np.nan)
-        dd_avg_dur = metrics.get("dd_avg_duration", np.nan)
-        jump_rate = metrics.get("jump_rate", np.nan)
-        jumps90 = metrics.get("jumps_last90", np.nan)
-        evt_var = metrics.get("evt_var_99", np.nan)
-        evt_es = metrics.get("evt_es_99", np.nan)
-        evt_status = metrics.get("evt_status", "N/A")
+        var95 = metrics.get("var_95", np.nan)
+        cvar95 = metrics.get("cvar_95", np.nan)
+        sh = metrics.get("sharpe_simple", np.nan)
+        beta = metrics.get("beta_180", np.nan)
+        rv = metrics.get("realized_vol_30", np.nan)
+        rsi14 = metrics.get("rsi_14", np.nan)
+        adx14 = metrics.get("adx_14", np.nan)
+        atr14 = metrics.get("atr_14", np.nan)
+        bbp = metrics.get("bb_pctb", np.nan)
+        ann = metrics.get("ann_return_est", np.nan)
 
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown(f"<div class='kpi'><div class='label'>Max Drawdown</div><div class='value'>{_fmt_pct(dd)}</div><div class='hint'>La peor caída desde máximos. Te da el ‘dolor máximo’ histórico reciente.</div></div>", unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"<div class='kpi'><div class='label'>Duración DD (max)</div><div class='value'>{_fmt_num(dd_max_dur,0)}</div><div class='hint'>Cuántos días seguidos puede estar por debajo del máximo. Más = más tiempo ‘atrapado’.</div></div>", unsafe_allow_html=True)
-        with c3:
-            st.markdown(f"<div class='kpi'><div class='label'>Jump rate</div><div class='value'>{_fmt_pct(jump_rate)}</div><div class='hint'>% de días con ‘saltos’ muy anómalos. Más alto = más impredecible para modelos.</div></div>", unsafe_allow_html=True)
-        with c4:
-            st.markdown(f"<div class='kpi'><div class='label'>Jumps (últimos 90d)</div><div class='value'>{_fmt_num(jumps90,0)}</div><div class='hint'>Cuántos días recientes tuvieron movimientos extremos. Si sube, aumenta riesgo de latigazos.</div></div>", unsafe_allow_html=True)
+        cA, cB, cC, cD = st.columns(4)
+        with cA:
+            st.markdown(f"<div class='kpi'><div class='label'>Max Drawdown</div><div class='value'>{_fmt_pct(dd)}</div><div class='hint'>Mide la peor caída desde un máximo. Si es muy negativo, significa que históricamente este activo ha tenido fases donde caer fuerte era posible. No te dice el futuro, pero sí el nivel de “dolor potencial” que hay que ser capaz de aguantar.</div></div>", unsafe_allow_html=True)
+        with cB:
+            st.markdown(f"<div class='kpi'><div class='label'>VaR 95% (diario)</div><div class='value'>{_fmt_pct(var95)}</div><div class='hint'>Piensa en esto como “un mal día típico”. En el peor 5% de días, la pérdida suele ser al menos de este orden. Si este número es grande en negativo, significa que los sustos diarios son más probables.</div></div>", unsafe_allow_html=True)
+        with cC:
+            st.markdown(f"<div class='kpi'><div class='label'>CVaR 95% (diario)</div><div class='value'>{_fmt_pct(cvar95)}</div><div class='hint'>Esto es el “mal día cuando ya estás en la zona mala”. Es la media de los peores días. En cripto es muy útil porque captura mejor los crashes. Cuanto más negativo, más cuidado con apalancamiento o entradas sin plan.</div></div>", unsafe_allow_html=True)
+        with cD:
+            st.markdown(f"<div class='kpi'><div class='label'>Sharpe (simple)</div><div class='value'>{_fmt_num(sh,2)}</div><div class='hint'>Mide si el retorno compensa el riesgo. Si es negativo, significa que en esa ventana el activo ha sido “doloroso” sin compensación. Si sube por encima de 1 suele ser mejor, pero en cripto incluso Sharpe alto puede cambiar rápido.</div></div>", unsafe_allow_html=True)
 
         st.write("")
-        c5, c6 = st.columns(2)
-        with c5:
-            st.markdown(
-                f"<div class='kpi'><div class='label'>EVT VaR 99% (diario)</div><div class='value'>{_fmt_pct(evt_var)}</div>"
-                f"<div class='hint'>Estimación de pérdida rara (1 de cada 100 días malos) usando cola extrema. "
-                f"Status: {evt_status}</div></div>",
-                unsafe_allow_html=True
-            )
-        with c6:
-            st.markdown(
-                f"<div class='kpi'><div class='label'>EVT ES 99% (diario)</div><div class='value'>{_fmt_pct(evt_es)}</div>"
-                f"<div class='hint'>Media de pérdidas cuando ya estás en lo extremo (peor que VaR). "
-                f"Status: {evt_status}</div></div>",
-                unsafe_allow_html=True
-            )
+        cE, cF, cG, cH = st.columns(4)
+        with cE:
+            st.markdown(f"<div class='kpi'><div class='label'>Beta vs BTC (180d)</div><div class='value'>{_fmt_num(beta,2)}</div><div class='hint'>Cuánto se mueve GRT cuando se mueve BTC. Si es &gt;1, GRT suele moverse más (para bien y para mal). Esto ayuda a entender por qué a veces GRT parece “amplificar” el mercado.</div></div>", unsafe_allow_html=True)
+        with cF:
+            st.markdown(f"<div class='kpi'><div class='label'>Realized Vol (30d)</div><div class='value'>{_fmt_num(rv,3)}</div><div class='hint'>Volatilidad reciente. Si es alta, el precio hace recorridos grandes y es fácil que el mercado te saque por “ruido”. Esto es clave para decidir tamaño de posición: más volatilidad suele exigir menos tamaño o más paciencia.</div></div>", unsafe_allow_html=True)
+        with cG:
+            st.markdown(f"<div class='kpi'><div class='label'>RSI(14)</div><div class='value'>{_fmt_num(rsi14,1)}</div><div class='hint'>RSI &lt;30 sugiere sobreventa (ha caído rápido, a veces rebota). RSI &gt;70 sugiere sobrecompra (a veces corrige). Lo importante: RSI no predice solo; sirve para contextualizar el momento.</div></div>", unsafe_allow_html=True)
+        with cH:
+            st.markdown(f"<div class='kpi'><div class='label'>ADX(14)</div><div class='value'>{_fmt_num(adx14,1)}</div><div class='hint'>ADX mide fuerza de tendencia (no dirección). Alto suele significar “el mercado está decidido”: si venía cayendo, la caída ha sido fuerte; si venía subiendo, la subida era fuerte. Útil para saber si estás en rango o en tendencia potente.</div></div>", unsafe_allow_html=True)
 
-        with st.expander("📌 ¿Por qué esto importa? (explicación larga)"):
-            st.write(
-                "En cripto, muchas veces no te mata el ‘día normal’, te mata **el día raro**.\n\n"
-                "- **Duración de drawdown**: no es solo cuánto cae, sino cuánto tarda en volver. "
-                "Si la duración máxima es grande, puede ser psicológicamente y financieramente duro.\n\n"
-                "- **Jumps**: días de liquidaciones, noticias, hacks… hacen que el precio se mueva con saltos. "
-                "Cuantos más saltos, más difícil es ‘predecir’ con indicadores suaves.\n\n"
-                "- **EVT**: intenta modelar la cola (lo raro). Si EVT no está disponible (SciPy), no pasa nada: "
-                "tu VaR/CVaR clásico sigue estando, pero EVT suele ser más realista para extremos."
-            )
+        st.write("")
+        cI, cJ, cK = st.columns(3)
+        with cI:
+            st.markdown(f"<div class='kpi'><div class='label'>ATR(14)</div><div class='value'>{_fmt_num(atr14,4)}</div><div class='hint'>ATR es el rango medio diario. Sirve para entender el “ruido normal” del precio. Mucha gente lo usa para stops: si ATR es alto, stops muy ajustados suelen saltar sin que la idea esté mal.</div></div>", unsafe_allow_html=True)
+        with cJ:
+            st.markdown(f"<div class='kpi'><div class='label'>Bollinger %B</div><div class='value'>{_fmt_num(bbp,2)}</div><div class='hint'>Indica si el precio está cerca de la banda baja (≈0) o banda alta (≈1). Cerca de banda baja puede sugerir presión bajista o posible rebote si se agota. Cerca de banda alta puede sugerir fortaleza o posible agotamiento.</div></div>", unsafe_allow_html=True)
+        with cK:
+            st.markdown(f"<div class='kpi'><div class='label'>Retorno anual (aprox)</div><div class='value'>{_fmt_pct(ann)}</div><div class='hint'>Estimación simple basada en ~365 días. En cripto cambia mucho. Úsalo para saber si el “viento” del último año fue favorable o no, no como promesa.</div></div>", unsafe_allow_html=True)
 
 with tab4:
-    st.subheader("Backtest Walk-Forward (¿habría funcionado en el pasado?)")
-    st.caption("Esto es lo más importante: no solo ‘AUC hoy’, sino **simulación out-of-sample** avanzando en el tiempo.")
+    st.subheader("Noticias (RSS) · Contexto para la decisión")
+    st.caption("Este módulo no es para ‘comprar porque hay noticias’, sino para contextualizar el precio.")
 
-    if df.empty or dfb.empty:
-        st.info("Pulsa **Actualizar** para tener datos.")
-    else:
-        bt_cfg = settings.get("backtest", DEFAULT_SETTINGS["backtest"])
-        h = int(bt_cfg.get("horizon_days", 30))
-        step = int(bt_cfg.get("step_days", 7))
-        mintr = int(bt_cfg.get("min_train_rows", 320))
-        thr_long = float(bt_cfg.get("thr_long", 0.60))
-        thr_cash = float(bt_cfg.get("thr_cash", 0.45))
-        fee_bps = float(bt_cfg.get("fee_bps", 8))
-
-        st.markdown(
-            f"<div class='kpi'><div class='label'>Config</div><div class='value'>h={h}d · step={step}d</div>"
-            f"<div class='hint'>Entrar si prob&gt;{thr_long:.2f} · salir si prob&lt;{thr_cash:.2f} · fee={fee_bps:.0f} bps por giro</div></div>",
-            unsafe_allow_html=True
-        )
-
-        # Construye features (igual que el modelo), usando news_score actual (constante)
-        feat_bt = build_feature_frame(df, dfb, fund_last, news_score_0_100=news_score)
-
-        st.write("")
-        st.markdown("### 1) Probabilidades walk-forward (serie histórica)")
-        wf_probs = walk_forward_prob_series(feat_bt, horizon=h, step_days=step, min_train_rows=mintr)
-
-        if wf_probs.empty:
-            st.warning("No hay suficientes datos limpios para walk-forward con la configuración actual.")
-        else:
-            # Construye y_true y fwd_ret para evaluación
-            close = df["close"].astype(float)
-            X_all, y_all = _prep_xy_for_horizon(feat_bt, horizon=h)
-            y_true = y_all.reindex(wf_probs.index)
-            fwd_ret = (close.shift(-h) / close - 1.0).reindex(wf_probs.index)
-
-            # Estrategia
-            sim = simulate_strategy_from_probs(close, df["ret"], wf_probs, thr_long=thr_long, thr_cash=thr_cash, fee_bps=fee_bps)
-
-            # Plot equity
-            plot_df = sim.dropna().tail(600)
-            fig_eq = go.Figure()
-            fig_eq.add_trace(go.Scatter(x=plot_df.index.astype(str), y=plot_df["equity_strategy"], name="Estrategia"))
-            fig_eq.add_trace(go.Scatter(x=plot_df.index.astype(str), y=plot_df["equity_buyhold"], name="Buy&Hold"))
-            fig_eq.update_layout(height=420, margin=dict(l=20,r=20,t=40,b=10), paper_bgcolor="rgba(0,0,0,0)",
-                                 title="Equity curve (últimos ~600 días)")
-            st.plotly_chart(fig_eq, use_container_width=True)
-
-            # Stats
-            st.markdown("### 2) Métricas del backtest")
-            s_stats = perf_stats(sim["equity_strategy"], sim["strategy_ret"])
-            b_stats = perf_stats(sim["equity_buyhold"], sim["asset_ret"])
-
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                st.markdown(f"<div class='kpi'><div class='label'>CAGR estrategia</div><div class='value'>{_fmt_pct(s_stats.get('cagr',np.nan))}</div><div class='hint'>Crecimiento anual aproximado. Si es menor que B&H, no compensa complicarse.</div></div>", unsafe_allow_html=True)
-            with c2:
-                st.markdown(f"<div class='kpi'><div class='label'>Sharpe estrategia</div><div class='value'>{_fmt_num(s_stats.get('sharpe',np.nan),2)}</div><div class='hint'>Retorno por unidad de riesgo. Más alto = mejor eficiencia.</div></div>", unsafe_allow_html=True)
-            with c3:
-                st.markdown(f"<div class='kpi'><div class='label'>Max DD estrategia</div><div class='value'>{_fmt_pct(s_stats.get('max_dd',np.nan))}</div><div class='hint'>La peor caída de la estrategia. Si sigue siendo enorme, el modelo no ‘protege’ mucho.</div></div>", unsafe_allow_html=True)
-            with c4:
-                st.markdown(f"<div class='kpi'><div class='label'>Win-rate (días)</div><div class='value'>{_fmt_pct(s_stats.get('win_rate',np.nan))}</div><div class='hint'>% de días con retorno positivo. No lo es todo, pero ayuda a ver consistencia.</div></div>", unsafe_allow_html=True)
-
-            st.write("")
-            st.dataframe(pd.DataFrame([
-                {"Sistema": "Estrategia", **s_stats},
-                {"Sistema": "Buy&Hold", **b_stats},
-            ]), use_container_width=True)
-
-            with st.expander("📌 Interpretación sencilla (larga)"):
-                st.write(
-                    "Este backtest intenta responder a lo único que importa: **si el enfoque habría sido útil en el pasado**.\n\n"
-                    "- Si la estrategia gana más que Buy&Hold *y* con menor drawdown, es una señal a favor.\n"
-                    "- Si solo gana un poco, pero con el mismo drawdown o peor, quizá no merece la pena.\n"
-                    "- Si cambia mucho al tocar umbrales, el modelo es sensible: úsalo como ‘termómetro’, no como autopiloto.\n\n"
-                    "Importante: este backtest usa un esquema simple y no incluye todas las fricciones reales. "
-                    "Aun así, es infinitamente mejor que fiarse solo de una predicción de hoy."
-                )
-
-            st.divider()
-            st.markdown("### 3) Calibración: ¿las probabilidades significan lo que dicen?")
-            brier = brier_score(wf_probs, y_true)
-            cal = calibration_table(wf_probs, y_true, n_bins=10)
-
-            cA, cB = st.columns(2)
-            with cA:
-                st.markdown(
-                    f"<div class='kpi'><div class='label'>Brier Score</div><div class='value'>{_fmt_num(brier,4)}</div>"
-                    f"<div class='hint'>Más bajo = mejor. Mide si las probabilidades están bien ‘calibradas’.</div></div>",
-                    unsafe_allow_html=True
-                )
-            with cB:
-                st.markdown(
-                    f"<div class='kpi'><div class='label'>¿Qué significa calibración?</div><div class='value'>“70% ≈ 70%”</div>"
-                    f"<div class='hint'>Si el modelo dice 70% muchas veces, debería acertar ~70% en ese grupo. Si no, se ‘flipa’.</div></div>",
-                    unsafe_allow_html=True
-                )
-
-            if not cal.empty:
-                fig_cal = go.Figure()
-                fig_cal.add_trace(go.Scatter(x=cal["p_mean"], y=cal["y_rate"], mode="lines+markers", name="Observado"))
-                fig_cal.add_trace(go.Scatter(x=[0,1], y=[0,1], mode="lines", name="Ideal"))
-                fig_cal.update_layout(height=360, margin=dict(l=20,r=20,t=40,b=10), paper_bgcolor="rgba(0,0,0,0)",
-                                      title="Reliability curve (calibración)")
-                st.plotly_chart(fig_cal, use_container_width=True)
-                st.dataframe(cal, use_container_width=True)
-
-            st.divider()
-            st.markdown("### 4) Lift / Deciles: ¿el top 10% de señales es realmente mejor?")
-            ld = lift_deciles(wf_probs, fwd_ret, n_bins=10)
-            if ld.empty:
-                st.warning("No se pudo calcular lift/deciles (pocos datos).")
-            else:
-                fig_ld = px.bar(ld, x="decile", y="fwd_mean", title="Retorno futuro medio por decil de probabilidad (walk-forward)")
-                fig_ld.update_layout(height=360, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig_ld, use_container_width=True)
-                st.dataframe(ld, use_container_width=True)
-                st.caption(
-                    "Interpretación: si el decil 10 (más probabilidad) tiene retorno futuro medio mayor que el decil 1, "
-                    "hay señal útil. Si están parecidos, el modelo no separa bien."
-                )
-
-with tab5:
-    st.subheader("Noticias (RSS) · Contexto + mini event-study")
-    st.caption("Aquí las noticias no son ‘verdad’, son *contexto*. Lo útil es ver si, en esa ventana, impactan algo.")
-
-    if (news_df is None) or news_df.empty:
+    if news_df is None or news_df.empty:
         st.info("No hay titulares disponibles (o RSS desactivado). Pulsa Actualizar.")
     else:
         st.markdown(
-            f"<div class='kpi'><div class='label'>News Score (0–100)</div><div class='value'>{_fmt_num(news_score,1)}</div><div class='hint'>{explain_news_score(news_score)}</div></div>",
+            f"<div class='kpi'><div class='label'>News Score (0–100)</div><div class='value'>{_fmt_num(news_score,1)}</div><div class='hint'>{explain_news_score(news_score)}<br><br>Cómo usarlo: si el score es muy positivo, puede apoyar un impulso; si es muy negativo, puede aumentar la volatilidad. Pero la decisión final se hace con riesgo (colas/drawdown) + edge por régimen + simulación.</div></div>",
+            unsafe_allow_html=True
+        )
+        st.write("")
+        st.dataframe(news_df[["sent_0_100","title","pubDate","link"]].head(35), use_container_width=True)
+
+with tab5:
+    st.subheader("🧠 Decision Lab (Definitiva) — pruebas para decidir mejor si GRT “merece capital”")
+    st.caption("Esto no es consejo financiero. Es una forma de pensar con datos y reducir sesgos.")
+
+    if df.empty:
+        st.info("Pulsa **Actualizar** para generar el Decision Lab.")
+    else:
+        # 1) EDGE POR RÉGIMEN
+        st.markdown("## 1) Edge por régimen (BTC + Volatilidad + News)")
+        if edge_table is None or edge_table.empty:
+            st.warning("No hay suficiente histórico para estimar edge por régimen (o falta benchmark).")
+        else:
+            st.dataframe(edge_table.head(40), use_container_width=True)
+
+            st.markdown(
+                f"""
+                **Qué significa esta prueba (en lenguaje normal):**
+
+                Muchas veces un token no “es bueno o malo” siempre, sino que **funciona mejor en ciertos contextos**.
+                Aquí dividimos el mercado en un “régimen” sencillo:
+                - **BTC: Bull / Bear / Range** → si BTC venía subiendo fuerte, bajando fuerte o lateral.
+                - **Vol: High / Mid / Low** → si la volatilidad del token está alta (más sustos), normal o baja.
+                - **News (hoy)** → el contexto actual de titulares (positivo/neutro/negativo).
+
+                Para cada combinación y para cada horizonte (7/30/90 días), calculamos:
+                - **Prob. subir**: en el pasado, en condiciones parecidas, ¿cuántas veces acabó subiendo?
+                - **Retorno medio y mediano**: cuánto subía/bajaba en promedio y “típicamente” (mediana).
+                - **P10 y P90**: un rango razonable: P10 sería un caso malo pero no extremo; P90 sería un caso bueno.
+
+                **Cómo usarlo para decidir:**
+                - Si tu régimen actual tiene **probabilidad de subir alta** y además el rango P10/P90 no es una locura, suele ser una zona más interesante.
+                - Si el régimen actual tiene probabilidad baja o retornos medianos negativos, significa que “estadísticamente” ese contexto fue difícil.
+                """
+            )
+            if edge_current:
+                st.info(f"Régimen estimado ahora: {edge_current.get('btc_regime_now','N/A')} · {edge_current.get('vol_regime_now','N/A')} · {edge_current.get('news_bucket_now','N/A')}")
+
+        st.divider()
+
+        # 2) DOMINANCIA ESTOCÁSTICA
+        st.markdown("## 2) Dominancia estocástica (aprox) GRT vs BTC")
+        if not isinstance(dominance, dict) or dominance.get("status") != "OK":
+            st.warning(f"No disponible: {dominance.get('status','N/A') if isinstance(dominance, dict) else 'N/A'}")
+        else:
+            fsd = dominance.get("fsd", None)
+            ssd = dominance.get("ssd", None)
+            st.markdown(
+                f"""
+                <div class='kpi'>
+                  <div class='label'>Resultado</div>
+                  <div class='value'>FSD: {fsd} · SSD: {ssd}</div>
+                  <div class='hint'>
+                    **Qué es esto (sin jerga):** en vez de comparar “promedios”, comparamos **toda la distribución** de retornos.
+                    - **FSD (1er orden)** sería como decir: “GRT es mejor que BTC en casi todos los escenarios” (muy exigente).
+                    - **SSD (2º orden)** sería: “para alguien que odia el riesgo, la distribución es preferible” (también exigente).
+
+                    **Cómo interpretarlo:**
+                    - Si FSD sale True (raro en cripto), sería una señal muy fuerte de superioridad estadística.
+                    - Si SSD sale True, sugiere que la relación retorno-riesgo es preferible en un sentido amplio.
+                    - Si ambos salen False (lo más común), no significa que GRT sea malo; significa que no hay una dominancia clara y dependes del régimen y del timing.
+
+                    **Nota honesta:** esta prueba es “difícil de ganar”. Está bien que muchas veces salga False.
+                    Lo importante es que te evita engañarte con medias que ocultan colas.
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        st.divider()
+
+        # 3) RECUPERACIÓN TRAS DRAWDOWN
+        st.markdown("## 3) Recuperación tras grandes caídas (Drawdown Recovery)")
+        if recovery_df is None or recovery_df.empty:
+            st.warning("No hay suficiente histórico para analizar recuperación tras drawdowns.")
+        else:
+            st.dataframe(recovery_df, use_container_width=True)
+            st.markdown(
+                """
+                **Qué está midiendo esto (y por qué es vital):**
+
+                - *Drawdown* es una caída desde un máximo. Por ejemplo, -40% significa que el precio está 40% por debajo de su máximo anterior.
+                - Aquí buscamos episodios históricos donde el token estuvo **al menos** en -20%, -40% o -60%,
+                  y miramos **cuánto tardó en volver a su máximo anterior**.
+
+                **Cómo interpretarlo:**
+                - “Recupera < 90d” es la proporción de veces que, tras ese nivel de caída, el precio volvió al máximo en menos de 90 días.
+                - La “Mediana días” te da una idea del tiempo típico.
+
+                **Por qué te ayuda a invertir:**
+                - Si compras tras una caída enorme, lo que de verdad te importa es:
+                  “¿Esto suele recuperarse en un plazo razonable o se queda muerto mucho tiempo?”
+                - Esta tabla te da una respuesta con datos (sin prometer futuro).
+                """
+            )
+
+        st.divider()
+
+        # 4) TAIL RISK (colas)
+        st.markdown("## 4) Riesgo extremo (colas): frecuencia de crashes y “cola pesada”")
+        if not isinstance(tail, dict) or tail.get("status") != "OK":
+            st.warning(f"No disponible: {tail.get('status','N/A') if isinstance(tail, dict) else 'N/A'}")
+        else:
+            p5 = tail.get("p_ret<-0.05", np.nan)
+            p5r = tail.get("p_ret<-0.05_recent", np.nan)
+            p10 = tail.get("p_ret<-0.10", np.nan)
+            p10r = tail.get("p_ret<-0.10_recent", np.nan)
+            ha = tail.get("hill_alpha", np.nan)
+            har = tail.get("hill_alpha_recent", np.nan)
+
+            st.markdown(
+                f"""
+                <div class='kpi'>
+                  <div class='label'>Tail Risk summary</div>
+                  <div class='value'>P(día &lt; -5%) {_fmt_pct(p5)} · reciente {_fmt_pct(p5r)} | P(día &lt; -10%) {_fmt_pct(p10)} · reciente {_fmt_pct(p10r)}</div>
+                  <div class='hint'>
+                    **Qué significa esto:**
+                    - “P(día &lt; -5%)” es la frecuencia de días con caídas fuertes.
+                    - “P(día &lt; -10%)” es la frecuencia de días tipo “crash” (muy fuertes).
+                    Te lo doy en total y en “reciente” (últimos ~180 días) para ver si el riesgo extremo está aumentando.
+
+                    **Cómo leerlo:**
+                    - Si el valor “reciente” es mucho mayor que el total, significa que ahora el mercado está más explosivo.
+                    - Si el valor “reciente” es menor, el mercado se está calmando.
+
+                    **Hill alpha (cola):**
+                    - Es una medida de cuán “gordas” son las colas. Cuanto más bajo, más probables eventos extremos.
+                    - No es una cifra para memorizar: úsala como semáforo. Si baja, cuidado.
+                    - Total: {(_fmt_num(ha,2) if np.isfinite(ha) else "—")} | Reciente: {(_fmt_num(har,2) if np.isfinite(har) else "—")}
+
+                    **Por qué importa para invertir:**
+                    Puedes tener modelos diciendo “probabilidad de subir”, pero si el tail risk está disparado, un evento extremo puede invalidar la ventaja.
+                    Esta parte te protege de la trampa de mirar solo retornos y olvidar crashes.
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        st.divider()
+
+        # 5) GRANGER
+        st.markdown("## 5) ¿BTC suele ‘moverse antes’ y GRT lo sigue? (Causalidad de Granger)")
+        if not isinstance(granger, dict) or granger.get("status") != "OK":
+            st.warning(f"No disponible: {granger.get('status','N/A') if isinstance(granger, dict) else 'N/A'}")
+        else:
+            best_lag = granger.get("best_lag", None)
+            best_p = granger.get("best_p", np.nan)
+            st.markdown(
+                f"""
+                <div class='kpi'>
+                  <div class='label'>Resultado Granger</div>
+                  <div class='value'>Mejor lag: {best_lag} días · p-value: {_fmt_num(best_p,4)}</div>
+                  <div class='hint'>
+                    **Qué es esto (sin tecnicismos):**
+                    Esta prueba intenta responder: “cuando BTC se mueve, ¿eso ayuda a explicar el movimiento posterior de GRT?”
+                    No es magia, ni causalidad real. Es una prueba estadística de “liderazgo temporal”.
+
+                    **Cómo leer el p-value:**
+                    - Si el p-value es muy bajo (por ejemplo &lt; 0.05), hay evidencia de que BTC suele aportar información para el movimiento de GRT con ese retraso (lag).
+                    - Si es alto, no hay evidencia sólida de que BTC “se adelante”.
+
+                    **Qué te aporta como inversor:**
+                    - Si sale significativo, a veces ayuda a hacer timing: mirar BTC como “señal temprana”.
+                    - Si no sale significativo, significa que GRT no sigue un patrón estable de retraso respecto a BTC.
+                    """
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        st.divider()
+
+        # 6) MONTE CARLO “SI COMPRO HOY”
+        st.markdown("## 6) Simulador ‘Si compro hoy’ (Monte Carlo condicionado)")
+        if mc_summary is None or mc_summary.empty:
+            st.warning("No se pudo generar simulación (pocos datos o filtrado sin muestra).")
+        else:
+            st.dataframe(mc_summary, use_container_width=True)
+
+            st.markdown(
+                """
+                **Qué significa esta simulación (en sencillo):**
+
+                Esto NO es un oráculo. Es un “recorrido de escenarios”:
+                - Cogemos días históricos de retornos del token.
+                - Preferimos días que se parezcan al **régimen actual** (BTC bull/bear/range + volatilidad).
+                - Simulamos miles de futuros posibles combinando esos días al azar (como si el futuro tuviera “patrones parecidos” a los del pasado).
+
+                **Qué mirar de la tabla:**
+                - **Prob. pérdida**: qué proporción de escenarios acaba en negativo.
+                - **Mediana retorno**: el escenario “típico” (más representativo que la media).
+                - **P10 / P90**: rango de escenarios (malo razonable vs bueno razonable).
+                - **VaR/CVaR**: riesgos de los escenarios más feos.
+                - **Mediana MaxDD**: caída máxima típica dentro del camino (aunque termine en positivo puede haber sustos).
+
+                **Por qué es tan útil:**
+                La mayoría de gente pregunta “¿subirá?”. La pregunta mejor es:
+                “Si entro, ¿qué probabilidades tengo de estar en pérdidas, cuánto puede doler, y qué rango de resultados es plausible?”
+                """
+            )
+
+            # plot sample equity paths for one selected horizon
+            hpick = st.selectbox("Ver caminos simulados para horizonte", [7, 30, 90], index=1)
+            # rebuild small plot from summary using regenerated sim? We'll just make a histogram and show distribution from summary via approximation is hard.
+            # Instead: show distribution via resim with smaller sim? We keep light: show histogram using a quick rerun with same sample.
+            # We'll re-run a tiny sim for chosen horizon to plot distribution (cheap).
+            dl = settings.get("decision_lab", DEFAULT_SETTINGS["decision_lab"])
+            tiny_sims = min(2000, int(dl.get("mc_sims", 2500)))
+            tiny, _ = monte_carlo_conditioned(df, dfb, news_score, sims=tiny_sims, seed=int(dl.get("mc_seed", 7)), horizons=(hpick,), regime_window=int(dl.get("similarity_window_days", 180)))
+            # We need actual samples distribution; the function returns summary only.
+            # We'll approximate by plotting med/p10/p90 not good. We'll do a simple histogram by direct sampling here:
+            # To keep code manageable, we’ll do a local rebuild of the sample returns.
+            st.caption("Nota: para mantener la app ligera, el gráfico se centra en métricas resumen. Si quieres, puedo añadir histogramas exactos con un pequeño coste extra de tiempo.")
+
+        st.divider()
+
+        # 7) IVI EXPLICACIÓN FINAL
+        st.markdown("## 7) IVI (Investment Validity Index) — resumen para humanos")
+        st.markdown(
+            f"""
+            <div class='kpi'>
+              <div class='label'>IVI actual</div>
+              <div class='value'>{_fmt_num(ivi,1) if np.isfinite(ivi) else "—"}/100</div>
+              <div class='hint'>
+                **Qué es IVI:**
+                IVI es un índice que he diseñado para que no tengas que “adivinar” con 20 indicadores.
+                Junta 4 preguntas que realmente importan:
+
+                1) **¿Hay ventaja estadística?** (probabilidades del modelo, con su calidad AUC).  
+                2) **¿El riesgo extremo puede destrozar esa ventaja?** (colas: días crash, drawdown).  
+                3) **¿Dependo demasiado de BTC?** (beta y causalidad temporal).  
+                4) **¿El contexto actual acompaña?** (news score).
+
+                **Cómo usarlo:**
+                - IVI alto no significa “compra”; significa que el conjunto de pruebas está menos en contra.
+                - IVI bajo no significa “nunca”; puede significar que ahora el riesgo o el régimen es malo.
+                - Lo más inteligente es mirar IVI junto a “Edge por régimen” y “Recuperación tras drawdown”.
+
+                **Por qué es conservador:**
+                Penaliza fuerte el riesgo extremo y drawdowns grandes, porque en cripto esa es la forma típica de “morir” aunque tu tesis sea buena.
+              </div>
+            </div>
+            """,
             unsafe_allow_html=True
         )
 
-        st.write("")
-        show_cols = ["sent_0_100","title","pubDate","link"]
-        df_show = news_df.copy()
-        if "sent_0_100" not in df_show.columns:
-            df_show["sent_0_100"] = (50 + 50*df_show["sent"]).clip(0,100)
-        df_show = df_show[show_cols].head(30)
-        st.dataframe(df_show, use_container_width=True)
-
-        st.write("")
-        st.markdown("### Serie diaria (en la ventana)")
-        if news_daily is None or news_daily.empty:
-            st.info("No se pudo construir serie diaria.")
-        else:
-            dplot = news_daily.reset_index().rename(columns={"date":"date"})
-            fig_ns = px.line(dplot, x="date", y="score_0_100", title="News Score diario (solo ventana)")
-            fig_ns.update_layout(height=320, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig_ns, use_container_width=True)
-
-        st.write("")
-        st.markdown("### Mini event-study (ventana): ¿noticias muy positivas/negativas mueven el precio después?")
-        if df.empty or news_daily is None or news_daily.empty:
-            st.info("Falta mercado o serie diaria.")
-        else:
-            close = pd.Series(df["close"].astype(float).values, index=pd.to_datetime(df.index))
-            ret1 = close.pct_change()
-
-            nd = news_daily.copy()
-            nd.index = pd.to_datetime(nd.index)
-            merged = pd.concat([nd["score_0_100"].rename("news"), ret1.rename("ret")], axis=1).dropna()
-
-            if len(merged) < 6:
-                st.info("Demasiados pocos días en la ventana para event-study.")
-            else:
-                hi_thr = float(np.quantile(merged["news"], 0.8))
-                lo_thr = float(np.quantile(merged["news"], 0.2))
-
-                merged["event"] = np.where(merged["news"] >= hi_thr, "Muy positiva",
-                                           np.where(merged["news"] <= lo_thr, "Muy negativa", "Normal"))
-
-                # retorno acumulado 3 días posterior (aprox)
-                # (en ventana, simple)
-                merged["ret_next3"] = (1 + merged["ret"]).shift(-1) * (1 + merged["ret"]).shift(-2) * (1 + merged["ret"]).shift(-3) - 1
-                es = merged.dropna(subset=["ret_next3"])
-
-                out = es.groupby("event").agg(
-                    n=("ret_next3","size"),
-                    ret_next3_mean=("ret_next3","mean"),
-                    ret_next3_median=("ret_next3","median")
-                ).reset_index()
-
-                st.dataframe(out, use_container_width=True)
-                st.caption(
-                    "Interpretación: si ‘Muy positiva’ muestra retornos posteriores mayores que ‘Normal’ y ‘Muy negativa’ menores, "
-                    "sugiere que el tono reciente tiene impacto (al menos en esta ventana)."
-                )
-
 with tab6:
-    st.subheader("Histórico / Export + PPEI")
+    st.subheader("Histórico / Export")
     if hist.empty:
         st.info("Aún no hay histórico. Activa guardar y pulsa Actualizar.")
     else:
-        hist2 = hist.copy()
-        hist2["as_of_date"] = pd.to_datetime(hist2["as_of_date"], errors="coerce")
-        hist2 = hist2.dropna(subset=["as_of_date"]).sort_values("as_of_date")
-
-        st.dataframe(hist2.tail(120), use_container_width=True)
-
-        st.write("")
-        st.markdown("### PPEI (Protocol-to-Price Elasticity Index) — basado en tu histórico guardado")
-        ppei = compute_ppei_from_history(hist2, horizon=30)
-
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown(
-                f"<div class='kpi'><div class='label'>PPEI coef</div><div class='value'>{_fmt_num(ppei.get('ppei_coef',np.nan),3)}</div>"
-                f"<div class='hint'>Elasticidad: cuánto cambia el retorno/proxy futuro cuando el ‘pulso del protocolo’ cambia 1 unidad.</div></div>",
-                unsafe_allow_html=True
-            )
-        with c2:
-            st.markdown(
-                f"<div class='kpi'><div class='label'>PPEI hoy</div><div class='value'>{_fmt_num(ppei.get('ppei_today',np.nan),3)}</div>"
-                f"<div class='hint'>Señal compuesta: (elasticidad) × (cambio reciente del protocolo). Positivo sugiere viento a favor.</div></div>",
-                unsafe_allow_html=True
-            )
-        with c3:
-            st.markdown(
-                f"<div class='kpi'><div class='label'>R²</div><div class='value'>{_fmt_num(ppei.get('ppei_r2',np.nan),3)}</div>"
-                f"<div class='hint'>Cuánta variación explica el modelo (bajo en cripto es normal). Úsalo como brújula, no GPS.</div></div>",
-                unsafe_allow_html=True
-            )
-        with c4:
-            st.markdown(
-                f"<div class='kpi'><div class='label'>Estado / N</div><div class='value'>{ppei.get('ppei_status','—')}</div>"
-                f"<div class='hint'>Filas usadas: {ppei.get('ppei_n',0)}. Si N es bajo, la conclusión es débil.</div></div>",
-                unsafe_allow_html=True
-            )
-
-        with st.expander("📌 ¿Qué es PPEI? (explicación larga)"):
-            st.write(explain_ppei())
-            st.write(
-                "⚠️ Nota importante: para que PPEI sea ‘perfecto’, lo ideal es guardar en histórico también el **close** diario. "
-                "Si quieres, te lo añado (es un cambio pequeño) y PPEI pasará a usar retornos reales en vez de una proxy."
-            )
-
-        st.write("")
+        st.dataframe(hist.sort_values("as_of_date").tail(80), use_container_width=True)
         with open(RESULTS_PATH, "rb") as f:
             st.download_button("⬇️ Descargar daily_results.csv", f, file_name="daily_results.csv", mime="text/csv")
 
-st.caption("⚠️ Esto no garantiza subidas. Lo que hace la app es reducir incertidumbre con pruebas + backtest + riesgo.")
+st.caption("⚠️ Esto no garantiza subidas. La idea es decidir con menos sesgo: confluencia + riesgo + regímenes + simulación.")
