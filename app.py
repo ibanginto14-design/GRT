@@ -2024,12 +2024,18 @@ with tab3:
                 f"Status: {evt_status}</div></div>",
                 unsafe_allow_html=True
             )
-        with c6_:
+                with c6_:
             st.markdown(
-                f"<div class='kpi'><div class='label'>EVT ES 99% (diario)</div
-                f"<div class='kpi'><div class='label'>EVT ES 99% (diario)</div><div class='value'>{_fmt_pct(evt_es)}</div>"
-                f"<div class='hint'>Si ocurre un día extremo, esta es la pérdida media esperada (peor que el VaR). "
-                f"Status: {evt_status}</div></div>",
+                f"""
+                <div class='kpi'>
+                  <div class='label'>EVT ES 99% (diario)</div>
+                  <div class='value'>{_fmt_pct(evt_es)}</div>
+                  <div class='hint'>
+                    Si ocurre un día extremo, esta es la pérdida media esperada (peor que el VaR).
+                    <br/>Status: {evt_status}
+                  </div>
+                </div>
+                """,
                 unsafe_allow_html=True
             )
 
@@ -2038,231 +2044,267 @@ with tab3:
                 "EVT (Extreme Value Theory) intenta modelar **la cola** (los días realmente raros).\n\n"
                 "- **VaR 99%**: umbral de pérdida que esperas superar ~1% de los días.\n"
                 "- **ES 99%**: si estás en ese 1% peor, cuál es la pérdida media.\n\n"
-                "Si el estado dice ‘Not enough data’ o ‘Too few exceedances’, no hay suficiente histórico de colas para estimarlo bien."
+                "Si el estado dice 'Not enough data' o 'Too few exceedances', no hay suficiente histórico de cola."
             )
 
         st.divider()
         st.markdown("### 4) PPEI (protocolo → precio) desde tu histórico guardado")
-        ppei = compute_ppei_from_history(hist, horizon=30) if (hist is not None and not hist.empty) else {"ppei_status":"No history"}
-        cP1, cP2, cP3, cP4 = st.columns(4)
-        with cP1:
+
+        ppei = compute_ppei_from_history(hist, horizon=30) if (hist is not None and not hist.empty) else {
+            "ppei_coef": np.nan, "ppei_today": np.nan, "ppei_r2": np.nan, "ppei_n": 0, "ppei_status": "No history"
+        }
+
+        cp1, cp2, cp3, cp4 = st.columns(4)
+        with cp1:
             st.markdown(
-                f"<div class='kpi'><div class='label'>PPEI coef</div><div class='value'>{_fmt_num(ppei.get('ppei_coef',np.nan),4)}</div>"
-                f"<div class='hint'>Elasticidad (proto→fwd). Status: {ppei.get('ppei_status','')}</div></div>",
+                f"""
+                <div class='kpi'>
+                  <div class='label'>PPEI coef</div>
+                  <div class='value'>{_fmt_num(ppei.get('ppei_coef', np.nan), 4)}</div>
+                  <div class='hint'>Elasticidad (proto→fwd). Status: {ppei.get('ppei_status','')}</div>
+                </div>
+                """,
                 unsafe_allow_html=True
             )
-        with cP2:
+        with cp2:
             st.markdown(
-                f"<div class='kpi'><div class='label'>PPEI hoy</div><div class='value'>{_fmt_num(ppei.get('ppei_today',np.nan),4)}</div>"
-                f"<div class='hint'>Pulso reciente × elasticidad.</div></div>",
+                f"""
+                <div class='kpi'>
+                  <div class='label'>PPEI hoy</div>
+                  <div class='value'>{_fmt_num(ppei.get('ppei_today', np.nan), 4)}</div>
+                  <div class='hint'>(coef × pulso proto reciente)</div>
+                </div>
+                """,
                 unsafe_allow_html=True
             )
-        with cP3:
+        with cp3:
             st.markdown(
-                f"<div class='kpi'><div class='label'>PPEI R²</div><div class='value'>{_fmt_num(ppei.get('ppei_r2',np.nan),3)}</div>"
-                f"<div class='hint'>Cuánto explica (0..1). En cripto suele ser bajo.</div></div>",
+                f"""
+                <div class='kpi'>
+                  <div class='label'>R²</div>
+                  <div class='value'>{_fmt_num(ppei.get('ppei_r2', np.nan), 3)}</div>
+                  <div class='hint'>Explicación (ojo: ruido alto en cripto)</div>
+                </div>
+                """,
                 unsafe_allow_html=True
             )
-        with cP4:
+        with cp4:
             st.markdown(
-                f"<div class='kpi'><div class='label'>PPEI N</div><div class='value'>{_fmt_num(ppei.get('ppei_n',0),0)}</div>"
-                f"<div class='hint'>Filas útiles.</div></div>",
+                f"""
+                <div class='kpi'>
+                  <div class='label'>N</div>
+                  <div class='value'>{_fmt_num(ppei.get('ppei_n', np.nan), 0)}</div>
+                  <div class='hint'>Filas usadas para estimar</div>
+                </div>
+                """,
                 unsafe_allow_html=True
             )
 
         with st.expander("📌 ¿Qué es PPEI? (explicación larga)"):
             st.write(explain_ppei())
 
+
 with tab4:
-    st.subheader("Backtest Walk-Forward (probabilidades → estrategia)")
+    st.subheader("Backtest walk-forward (probabilidades → señal → equity)")
 
     if df.empty:
         st.info("Pulsa **Actualizar (calcular todo)**.")
     else:
-        bt_cfg = settings.get("backtest", DEFAULT_SETTINGS["backtest"])
-        horizon = int(bt_cfg.get("horizon_days", 30))
-        step_days = int(bt_cfg.get("step_days", 7))
-        min_train_rows = int(bt_cfg.get("min_train_rows", 320))
-        thr_long = float(bt_cfg.get("thr_long", 0.60))
-        thr_cash = float(bt_cfg.get("thr_cash", 0.45))
-        fee_bps = float(bt_cfg.get("fee_bps", 8))
+        feat_bt = build_feature_frame(df, dfb, fund_last, news_score_0_100=news_score)
 
-        st.caption(
-            f"Horizonte: {horizon}d · Paso: {step_days}d · Min train: {min_train_rows} · "
-            f"Entrar>{thr_long:.2f} · Salir<{thr_cash:.2f} · Fee {fee_bps:.1f} bps"
+        st.write("Calculando serie de probabilidades walk-forward… (puede tardar)")
+        prob_series = walk_forward_prob_series(
+            feat_bt,
+            horizon=int(bt_h),
+            step_days=int(bt_step),
+            min_train_rows=int(bt_mintrain)
         )
 
-        feat = build_feature_frame(df, dfb, fund_last, news_score_0_100=news_score)
-
-        with st.spinner("Calculando serie walk-forward (puede tardar)…"):
-            prob_series = walk_forward_prob_series(
-                feat, horizon=horizon, step_days=step_days, min_train_rows=min_train_rows
-            )
-
         if prob_series.empty:
-            st.warning("No hay suficientes datos para generar backtest walk-forward con estos parámetros.")
+            st.warning("No hay suficientes datos para el walk-forward con tus parámetros.")
         else:
-            bt_df = simulate_strategy_from_probs(
+            sim = simulate_strategy_from_probs(
                 close=df["close"],
                 ret=df["ret"],
                 probs=prob_series,
-                thr_long=thr_long,
-                thr_cash=thr_cash,
-                fee_bps=fee_bps
+                thr_long=float(bt_thr_long),
+                thr_cash=float(bt_thr_cash),
+                fee_bps=float(bt_fee)
             )
 
-            # Stats
-            ps = perf_stats(bt_df["equity_strategy"], bt_df["strategy_ret"])
-            bh = perf_stats(bt_df["equity_buyhold"], bt_df["asset_ret"])
-
-            s1, s2, s3, s4 = st.columns(4)
-            with s1:
-                st.markdown(
-                    f"<div class='kpi'><div class='label'>CAGR (estrategia)</div><div class='value'>{_fmt_pct(ps.get('cagr',np.nan))}</div>"
-                    f"<div class='hint'>Buy&Hold: {_fmt_pct(bh.get('cagr',np.nan))}</div></div>",
-                    unsafe_allow_html=True
-                )
-            with s2:
-                st.markdown(
-                    f"<div class='kpi'><div class='label'>Sharpe (estrategia)</div><div class='value'>{_fmt_num(ps.get('sharpe',np.nan),2)}</div>"
-                    f"<div class='hint'>Buy&Hold: {_fmt_num(bh.get('sharpe',np.nan),2)}</div></div>",
-                    unsafe_allow_html=True
-                )
-            with s3:
-                st.markdown(
-                    f"<div class='kpi'><div class='label'>Max DD (estrategia)</div><div class='value'>{_fmt_pct(ps.get('max_dd',np.nan))}</div>"
-                    f"<div class='hint'>Buy&Hold: {_fmt_pct(bh.get('max_dd',np.nan))}</div></div>",
-                    unsafe_allow_html=True
-                )
-            with s4:
-                st.markdown(
-                    f"<div class='kpi'><div class='label'>Win rate (estrategia)</div><div class='value'>{_fmt_pct(ps.get('win_rate',np.nan))}</div>"
-                    f"<div class='hint'>Buy&Hold: {_fmt_pct(bh.get('win_rate',np.nan))}</div></div>",
-                    unsafe_allow_html=True
-                )
-
-            st.write("")
             st.markdown("### Equity curve")
-            eq = bt_df.reset_index().rename(columns={"index":"date"})
-            fig_eq = go.Figure()
-            fig_eq.add_trace(go.Scatter(x=eq["date"], y=eq["equity_strategy"], name="Estrategia"))
-            fig_eq.add_trace(go.Scatter(x=eq["date"], y=eq["equity_buyhold"], name="Buy&Hold"))
-            fig_eq.update_layout(height=420, margin=dict(l=20,r=20,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)")
+            eq_df = sim.reset_index().rename(columns={"index": "date"})
+            fig_eq = px.line(eq_df, x="date", y=["equity_strategy", "equity_buyhold"], title="Estrategia vs Buy&Hold")
+            fig_eq.update_layout(height=420, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig_eq, use_container_width=True)
 
-            st.markdown("### Posición y probabilidad")
-            fig_pp = go.Figure()
-            fig_pp.add_trace(go.Scatter(x=eq["date"], y=eq["prob"], name="Prob"))
-            fig_pp.add_trace(go.Scatter(x=eq["date"], y=eq["position"], name="Posición"))
-            fig_pp.update_layout(height=320, margin=dict(l=20,r=20,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig_pp, use_container_width=True)
+            st.markdown("### Probabilidades y posición")
+            fig_p = px.line(eq_df, x="date", y="prob", title=f"Probabilidad walk-forward (h={bt_h}d)")
+            fig_p.update_layout(height=260, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_p, use_container_width=True)
+
+            fig_pos = px.area(eq_df, x="date", y="position", title="Posición (0=cash, 1=long)")
+            fig_pos.update_layout(height=220, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_pos, use_container_width=True)
+
+            st.markdown("### Métricas de performance")
+            ps = perf_stats(sim["equity_strategy"], sim["strategy_ret"])
+            pb = perf_stats(sim["equity_buyhold"], sim["asset_ret"])
+
+            r1, r2 = st.columns(2)
+            with r1:
+                st.markdown(
+                    f"""
+                    <div class='kpi'>
+                      <div class='label'>Estrategia</div>
+                      <div class='value'>CAGR {_fmt_pct(ps.get('cagr', np.nan))}</div>
+                      <div class='hint'>Sharpe {_fmt_num(ps.get('sharpe', np.nan),2)} · MaxDD {_fmt_pct(ps.get('max_dd', np.nan))} · WinRate {_fmt_pct(ps.get('win_rate', np.nan))}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+            with r2:
+                st.markdown(
+                    f"""
+                    <div class='kpi'>
+                      <div class='label'>Buy & Hold</div>
+                      <div class='value'>CAGR {_fmt_pct(pb.get('cagr', np.nan))}</div>
+                      <div class='hint'>Sharpe {_fmt_num(pb.get('sharpe', np.nan),2)} · MaxDD {_fmt_pct(pb.get('max_dd', np.nan))} · WinRate {_fmt_pct(pb.get('win_rate', np.nan))}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
             st.divider()
-            st.markdown("### Calibración y lift (para ver si las probabilidades ‘tienen sentido’)")
+            st.markdown("### Calibración (bins) + Brier score")
 
-            # y_true alineado a prob_series: subida real al horizonte
-            y_true = (((df["close"].shift(-horizon) / df["close"]) - 1.0) > 0).astype(int)
-            y_true = y_true.reindex(prob_series.index)
+            # y_true para el mismo horizonte, alineado
+            _, y_all = _prep_xy_for_horizon(feat_bt, int(bt_h))
+            y_true = y_all.reindex(prob_series.index)
 
             cal = calibration_table(prob_series, y_true, n_bins=10)
-            brier = brier_score(prob_series, y_true)
+            bs = brier_score(prob_series, y_true)
 
-            cA, cB = st.columns(2)
+            cA, cB = st.columns([2, 1])
             with cA:
-                st.markdown(f"<div class='kpi'><div class='label'>Brier score</div><div class='value'>{_fmt_num(brier,4)}</div>"
-                            f"<div class='hint'>Más bajo = mejor calibración.</div></div>", unsafe_allow_html=True)
+                if cal.empty:
+                    st.warning("No hay suficientes datos para calibración.")
+                else:
+                    st.dataframe(cal, use_container_width=True)
+                    cal_plot = cal.copy()
+                    cal_plot["bin_id"] = np.arange(1, len(cal_plot) + 1)
+                    fig_cal = px.line(cal_plot, x="bin_id", y=["p_mean", "y_rate"], title="Calibración: prob media vs tasa real")
+                    fig_cal.update_layout(height=320, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
+                    st.plotly_chart(fig_cal, use_container_width=True)
             with cB:
-                st.markdown(f"<div class='kpi'><div class='label'>Muestras (prob)</div><div class='value'>{_fmt_num(len(prob_series),0)}</div>"
-                            f"<div class='hint'>Puntos walk-forward generados.</div></div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"""
+                    <div class='kpi'>
+                      <div class='label'>Brier score</div>
+                      <div class='value'>{_fmt_num(bs, 4)}</div>
+                      <div class='hint'>Más bajo = mejor calibración</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
-            if not cal.empty:
-                fig_cal = px.line(cal, x="p_mean", y="y_rate", markers=True, title="Calibración: p vs frecuencia real")
-                fig_cal.update_layout(height=340, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig_cal, use_container_width=True)
-                st.dataframe(cal, use_container_width=True)
+            st.divider()
+            st.markdown("### Lift por deciles (¿las probs altas dan mejores returns?)")
+            fwd_ret = (df["close"].shift(-int(bt_h)) / df["close"] - 1.0).astype(float)
+            lift = lift_deciles(prob_series, fwd_ret.reindex(prob_series.index), n_bins=10)
+            if lift.empty:
+                st.warning("No hay suficientes datos para lift.")
             else:
-                st.info("Calibración no disponible (pocos datos).")
-
-            fwd_ret = (df["close"].shift(-horizon) / df["close"] - 1.0).reindex(prob_series.index)
-            lift = lift_deciles(prob_series, fwd_ret, n_bins=10)
-            if not lift.empty:
-                fig_lift = px.bar(lift, x="decile", y="fwd_mean", title="Lift: retorno futuro medio por decil de prob.")
-                fig_lift.update_layout(height=340, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig_lift, use_container_width=True)
                 st.dataframe(lift, use_container_width=True)
-            else:
-                st.info("Lift no disponible (pocos datos).")
+                fig_l = px.bar(lift, x="decile", y="fwd_mean", title="Forward return medio por decil de prob")
+                fig_l.update_layout(height=320, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(fig_l, use_container_width=True)
+
+            with st.expander("📌 Cómo leer el backtest (sin humo)"):
+                st.write(
+                    "- Walk-forward significa que cada predicción usa SOLO el pasado, como en vida real.\n"
+                    "- La estrategia entra/sale por umbrales. Si subes el umbral, hay menos trades pero más selectivos.\n"
+                    "- Mira MaxDD y duración de DD: en cripto importa tanto como el retorno.\n"
+                    "- Si Lift no mejora en deciles altos, el modelo probablemente no añade ventaja."
+                )
+
 
 with tab5:
-    st.subheader("Noticias (RSS)")
-
-    news_cfg = settings.get("news", DEFAULT_SETTINGS["news"])
-    st.caption(f"Ventana: {int(news_cfg.get('lookback_days',14))} días · Score: {_fmt_num(news_score,1) if np.isfinite(news_score) else '—'}")
+    st.subheader("Noticias (RSS) · Titulares y serie diaria")
 
     if news_df is None or news_df.empty:
-        st.info("No hay titulares (o RSS desactivado).")
+        st.info("No hay noticias en la ventana (o RSS desactivado / falló).")
     else:
-        # Serie diaria
+        st.markdown("### Score actual")
+        st.markdown(
+            f"""
+            <div class='kpi'>
+              <div class='label'>News Score (0–100)</div>
+              <div class='value'>{_fmt_num(news_score, 1) if np.isfinite(news_score) else "—"}</div>
+              <div class='hint'>{explain_news_score(news_score)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        st.write("")
+        st.markdown("### Serie diaria (media)")
         if news_daily is not None and not news_daily.empty:
-            nd = news_daily.reset_index().rename(columns={"index":"date"})
+            nd = news_daily.reset_index().rename(columns={"index": "date"})
+            nd["date"] = nd["date"].astype(str)
             fig_nd = px.line(nd, x="date", y="score_0_100", title="News score diario (media)")
-            fig_nd.update_layout(height=320, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
+            fig_nd.update_layout(height=280, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig_nd, use_container_width=True)
 
-        st.markdown("### Titulares en ventana")
-        show_n = st.slider("Mostrar N titulares", 10, 80, 30, step=5)
-        show = news_df.head(int(show_n)).copy()
+        st.write("")
+        st.markdown("### Titulares (filtrables)")
+        q = st.text_input("Buscar en titulares", value="")
+        df_show = news_df.copy()
+        if q.strip():
+            qq = _clean_text(q.strip())
+            df_show = df_show[df_show["title"].apply(lambda s: qq in _clean_text(str(s)))]
 
-        # Render bonito
-        for _, row in show.iterrows():
-            t = row.get("title","")
-            link = row.get("link","")
-            d = row.get("date", "")
-            sc = row.get("sent_0_100", np.nan)
-            st.markdown(
-                f"""
-                <div class='kpi'>
-                  <div class='label'>{str(d)[:10]} · Score {_fmt_num(sc,1)}</div>
-                  <div class='value' style='font-size:16px; font-weight:800; line-height:1.2'>
-                    <a href="{link}" target="_blank" style="color:#E8EEFF; text-decoration:none;">{t}</a>
-                  </div>
-                  <div class='hint small-muted'>Fuente: Google News RSS · {row.get('pubDate','')}</div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+        df_show = df_show.sort_values("date", ascending=False)
+        st.dataframe(df_show[["date", "title", "sent_0_100", "link"]], use_container_width=True)
+
 
 with tab6:
     st.subheader("Histórico / Export")
 
-    hist = load_results()
-    if hist.empty:
-        st.info("Aún no hay histórico. Activa “Guardar resultado” y pulsa Actualizar.")
+    if hist is None or hist.empty:
+        st.info("Aún no hay histórico. Activa “Guardar resultado al actualizar” y pulsa **Actualizar**.")
     else:
-        # ✅ FIX: ordenar por fecha y mostrar resumen
-        hist["as_of_date"] = pd.to_datetime(hist["as_of_date"], errors="coerce")
-        hist = hist.dropna(subset=["as_of_date"]).sort_values("as_of_date")
+        h = hist.copy()
+        # Orden robusto
+        h["as_of_date"] = pd.to_datetime(h["as_of_date"], errors="coerce")
+        h = h.dropna(subset=["as_of_date"]).sort_values("as_of_date", ascending=False)
 
         st.markdown("### Últimos resultados guardados")
-        last_n = st.slider("Filas a mostrar", 10, 300, 60, step=10)
-        st.dataframe(hist.tail(int(last_n)), use_container_width=True)
+        st.dataframe(h.head(200), use_container_width=True)
 
         st.write("")
-        st.markdown("### Evolución del Score y Probabilidades")
-        plot_cols = ["score_0_100", "p_up_7d", "p_up_30d", "p_up_90d", "news_score_0_100"]
-        plot_cols = [c for c in plot_cols if c in hist.columns]
+        st.markdown("### Gráfico Score + Probabilidades")
+        hh = h.sort_values("as_of_date")
+        plot = pd.DataFrame({
+            "date": hh["as_of_date"].dt.date.astype(str),
+            "score": pd.to_numeric(hh.get("score_0_100", np.nan), errors="coerce"),
+            "p7": pd.to_numeric(hh.get("p_up_7d", np.nan), errors="coerce"),
+            "p30": pd.to_numeric(hh.get("p_up_30d", np.nan), errors="coerce"),
+            "p90": pd.to_numeric(hh.get("p_up_90d", np.nan), errors="coerce"),
+            "news": pd.to_numeric(hh.get("news_score_0_100", np.nan), errors="coerce"),
+        })
 
-        if plot_cols:
-            hplot = hist[["as_of_date"] + plot_cols].copy()
-            hplot = hplot.rename(columns={"as_of_date":"date"})
-            fig_hist = px.line(hplot, x="date", y=plot_cols, title="Histórico: Score / Prob / News")
-            fig_hist.update_layout(height=420, margin=dict(l=20,r=20,t=50,b=10), paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig_hist, use_container_width=True)
+        fig_hist = px.line(plot, x="date", y=["score", "news"], title="Score y News (histórico)")
+        fig_hist.update_layout(height=320, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_hist, use_container_width=True)
 
-        st.divider()
+        fig_probs = px.line(plot, x="date", y=["p7", "p30", "p90"], title="Probabilidades (histórico)")
+        fig_probs.update_layout(height=320, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_probs, use_container_width=True)
+
+        st.write("")
         st.markdown("### Exportar CSV")
-
-        csv_bytes = hist.to_csv(index=False).encode("utf-8")
+        csv_bytes = h.to_csv(index=False).encode("utf-8")
         st.download_button(
             "⬇️ Descargar histórico (CSV)",
             data=csv_bytes,
@@ -2270,15 +2312,12 @@ with tab6:
             mime="text/csv"
         )
 
-        st.markdown("### Consejos para que el histórico tenga más valor")
-        st.write(
-            "- Intenta actualizar **una vez al día** (misma hora aproximada) para que el backtest sea más estable.\n"
-            "- Si activas Gateway, guardas métricas del protocolo más ricas → PPEI mejora.\n"
-            "- Evita cambiar símbolos continuamente: rompe comparabilidad."
-        )
+        st.caption("Tip: si cambias de máquina o repo, copia la carpeta /data para mantener el histórico.")
+
 
 # =========================
 # FOOTER
 # =========================
 st.write("")
 st.caption("⚠️ Esto no es asesoramiento financiero. Es una app educativa/analítica: en cripto, el riesgo de pérdida es alto.")
+
